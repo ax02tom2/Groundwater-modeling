@@ -76,8 +76,6 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("⚙️ 3. 模型參數設定")
         model_choice = st.sidebar.selectbox("選擇預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
-        
-        # --- 新增的說明區塊 ---
         rolling_windows = st.sidebar.multiselect(
             "選擇降雨累積天數 (特徵工程)", 
             options=[1, 3, 5, 7, 14, 20, 30, 60], 
@@ -90,7 +88,7 @@ if rain_file and hobo_file:
             "🎯 **建議設定值：**\n"
             "- **淺層/反應快：** `1, 3, 5, 7`\n"
             "- **深層/反應慢：** `14, 30, 60`\n"
-            "- **萬用推薦 (預設)：** `1, 3, 7, 14, 30` (兼顧短期與中長期，適用大多數地質)"
+            "- **萬用推薦 (預設)：** `1, 3, 7, 14, 30`"
         )
 
         st.sidebar.markdown("---")
@@ -103,6 +101,8 @@ if rain_file and hobo_file:
             "選擇區間 (開始與結束)",
             value=(default_start, default_end)
         )
+        
+        validation_mode = st.sidebar.checkbox("🧪 啟動驗證模式 (隱藏所選區間的實際資料，測試 AI 盲測準確度)", value=False)
 
         if st.button("🚀 確認無誤，開始執行模擬預測"):
             if len(impute_date_range) != 2:
@@ -136,21 +136,24 @@ if rain_file and hobo_file:
                 
                 df_model = df.dropna(subset=[f'Rain_{w}D_Sum' for w in rolling_windows])
                 
-                train_data = df_model.dropna(subset=['WaterLevel'])
+                original_df = df_model.copy()
                 
+                if validation_mode:
+                    mask = (df_model.index.date >= start_date) & (df_model.index.date <= end_date)
+                    df_model.loc[mask, 'WaterLevel'] = np.nan
+                
+                train_data = df_model.dropna(subset=['WaterLevel'])
                 all_predict_data = df_model[df_model['WaterLevel'].isna()]
                 predict_data = all_predict_data.loc[str(start_date) : str(end_date)]
                 
                 if len(train_data) == 0:
-                    st.error("❌ 找不到雨量與水位重疊的時間段，無法訓練模型！")
+                    st.error("❌ 找不到可用於訓練的時間段 (可能您將所有重疊的資料都選為驗證區間了)。")
                     st.stop()
                 if len(predict_data) == 0:
                     st.warning(f"⚠️ 在您選擇的區間 ({start_date} ~ {end_date}) 內，沒有需要補遺的資料！")
                     st.stop()
 
                 # --- 訓練與預測 ---
-                st.success(f"**✅ 解析成功！** 訓練歷史 `{len(train_data)}` 天，將模擬 `{len(predict_data)}` 天的水位 (區間: {start_date} ~ {end_date})。")
-                
                 features = [f'Rain_{w}D_Sum' for w in rolling_windows]
                 X_train = train_data[features]
                 y_train = train_data['WaterLevel']
@@ -167,10 +170,24 @@ if rain_file and hobo_file:
                 predict_data_copy = predict_data.copy()
                 predict_data_copy['WaterLevel_Simulated'] = predicted_levels
                 
-                final_df = df.copy()
+                if validation_mode:
+                    val_compare = pd.DataFrame({
+                        'Actual': original_df.loc[predict_data_copy.index, 'WaterLevel'],
+                        'Predicted': predict_data_copy['WaterLevel_Simulated']
+                    }).dropna()
+                    
+                    if len(val_compare) > 0:
+                        mae = np.abs(val_compare['Actual'] - val_compare['Predicted']).mean()
+                        st.success(f"**🧪 盲測驗證完成！** 測試天數：`{len(val_compare)}` 天 │ AI 預測與實際水位的平均誤差為：**{mae:.3f} 公尺**")
+                    else:
+                        st.warning("所選區間內原本就沒有實際水位資料，無法計算誤差，退回一般補遺模式。")
+                else:
+                    st.success(f"**✅ 解析成功！** 訓練歷史 `{len(train_data)}` 天，將模擬補遺 `{len(predict_data)}` 天的水位 (區間: {start_date} ~ {end_date})。")
+                
+                final_df = original_df.copy()
                 final_df['Simulated'] = False
-                final_df.loc[predict_data_copy.index, 'WaterLevel'] = predict_data_copy['WaterLevel_Simulated']
-                final_df.loc[predict_data_copy.index, 'Simulated'] = True
+                final_df['WaterLevel_Simulated'] = np.nan
+                final_df.loc[predict_data_copy.index, 'WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated']
                 
                 # --- 繪製上下分離子圖表 (Subplots) ---
                 st.markdown("### 📈 地下水位與雨量動態圖")
@@ -183,15 +200,25 @@ if rain_file and hobo_file:
                     subplot_titles=("地下水位變化", "日降雨量")
                 )
                 
-                actual_mask = final_df['Simulated'] == False
-                fig.add_trace(go.Scatter(x=final_df[actual_mask].index, y=final_df[actual_mask]['WaterLevel'], 
-                                         mode='lines', name='實際觀測水位', line=dict(color='blue')),
-                              row=1, col=1)
+                # 🎨 【視覺優化 1】實際觀測水位：改用 60% 透明度的藍色，退為背景參考線
+                actual_mask = final_df['WaterLevel'].notna()
+                fig.add_trace(go.Scatter(
+                    x=final_df[actual_mask].index, 
+                    y=final_df.loc[actual_mask, 'WaterLevel'], 
+                    mode='lines', 
+                    name='實際觀測水位', 
+                    line=dict(color='rgba(31, 119, 180, 0.5)', width=2.5) # 半透明藍色
+                ), row=1, col=1)
                 
-                sim_mask = final_df['Simulated'] == True
-                fig.add_trace(go.Scatter(x=final_df[sim_mask].index, y=final_df[sim_mask]['WaterLevel'], 
-                                         mode='lines', name='AI 模擬補遺水位', line=dict(color='orange', dash='dot')),
-                              row=1, col=1)
+                # 🎨 【視覺優化 2】AI 模擬水位：取消虛線，改用高對比、無透明度的亮橘紅實線
+                sim_mask = final_df['WaterLevel_Simulated'].notna()
+                fig.add_trace(go.Scatter(
+                    x=final_df[sim_mask].index, 
+                    y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
+                    mode='lines', 
+                    name='AI 模擬補遺水位', 
+                    line=dict(color='#FF4B4B', width=2) # 飽和亮橘紅色實線
+                ), row=1, col=1)
                 
                 fig.add_trace(go.Bar(x=final_df.index, y=final_df['Rainfall'], 
                                      name='日雨量', marker_color='rgba(0, 191, 255, 0.7)'),
@@ -211,9 +238,20 @@ if rain_file and hobo_file:
                 
                 # --- 檔案下載 ---
                 st.markdown("### 📥 下載模擬結果")
-                output_df = final_df[['Rainfall', 'WaterLevel', 'Simulated']].rename(
-                    columns={'WaterLevel': 'WaterLevel(m)', 'Simulated': 'Is_Simulated_Data'}
-                )
+                
+                if validation_mode:
+                    output_df = final_df[['Rainfall', 'WaterLevel', 'WaterLevel_Simulated']].rename(
+                        columns={'WaterLevel': 'Actual_WaterLevel(m)', 'WaterLevel_Simulated': 'Simulated_WaterLevel(m)'}
+                    )
+                else:
+                    merged_waterlevel = final_df['WaterLevel'].fillna(final_df['WaterLevel_Simulated'])
+                    is_simulated = final_df['WaterLevel'].isna() & final_df['WaterLevel_Simulated'].notna()
+                    output_df = pd.DataFrame({
+                        'Rainfall': final_df['Rainfall'],
+                        'WaterLevel(m)': merged_waterlevel,
+                        'Is_Simulated_Data': is_simulated
+                    })
+                
                 csv_buffer = io.StringIO()
                 output_df.to_csv(csv_buffer)
                 csv_bytes = csv_buffer.getvalue().encode('utf-8-sig')
