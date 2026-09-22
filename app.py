@@ -75,16 +75,16 @@ if rain_file and hobo_file:
         
         model_choice = st.sidebar.selectbox("預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
         
+        # 🌟 補回 365 天的長期記憶選項！
         rolling_windows = st.sidebar.multiselect(
             "降雨累積天數 (特徵)", 
-            options=[1, 3, 7, 14, 30, 60, 90, 180], 
-            default=[1, 3, 7, 14, 30, 60, 90]
+            options=[1, 3, 7, 14, 30, 60, 90, 180, 365], 
+            default=[1, 3, 7, 14, 30, 60, 90, 180, 365]
         )
         
         st.sidebar.markdown("---")
         st.sidebar.header("🎛️ 4. 預測結果後期微調 (Post-processing)")
         
-        # 最直接暴力的解法：手動倍率放大
         amplitude_multiplier = st.sidebar.slider(
             "🚀 振幅放大器 (強制撐開波峰波谷)", 
             min_value=1.0, max_value=5.0, value=1.5, step=0.1,
@@ -132,7 +132,7 @@ if rain_file and hobo_file:
                     mask = (df.index.date >= start_date) & (df.index.date <= end_date)
                     df.loc[mask, 'WaterLevel'] = np.nan
                 
-                # 建立特徵：只用最單純的累積雨量與季節週期
+                # 建立特徵：包含 365 天的超級長期記憶
                 features = []
                 for window in rolling_windows:
                     feat_name = f'Rain_{window}D_Sum'
@@ -167,7 +167,6 @@ if rain_file and hobo_file:
                 # --- 後期微調 1：強制振幅放大 ---
                 if amplitude_multiplier > 1.0 and len(predicted_levels) > 0:
                     pred_mean = predicted_levels.mean()
-                    # 以預測的平均值為中心，將波峰波谷上下拉開
                     predicted_levels = pred_mean + (predicted_levels - pred_mean) * amplitude_multiplier
                 
                 predict_data_copy = predict_data.copy()
@@ -189,18 +188,15 @@ if rain_file and hobo_file:
                     
                     offset_start, offset_end = 0, 0
                     
-                    # 計算預測線頭端與真實線尾端的落差
                     if len(past_actuals) > 0:
                         offset_start = past_actuals.iloc[-1] - predict_data_copy['WaterLevel_Simulated'].iloc[0]
                         
-                    # 計算預測線尾端與真實線頭端的落差
                     if len(future_actuals) > 0:
                         offset_end = future_actuals.iloc[0] - predict_data_copy['WaterLevel_Simulated'].iloc[-1]
                     elif len(past_actuals) > 0:
-                        offset_end = offset_start # 若未來無資料，保持水平平移
+                        offset_end = offset_start 
                         
                     n_steps = len(predict_data_copy)
-                    # 產生一個漸變的傾斜修正量加回去，確保頭尾 100% 貼合
                     drift_correction = np.linspace(offset_start, offset_end, n_steps)
                     predict_data_copy['WaterLevel_Simulated'] += drift_correction
                 
