@@ -42,7 +42,7 @@ def clean_and_parse_numbers(num_series):
     extracted = num_series.astype(str).str.extract(r'([-+]?\d*\.?\d+)')[0]
     return pd.to_numeric(extracted, errors='coerce')
 
-# --- 側邊欄：檔案上傳 ---
+# --- 側邊欄設定 ---
 st.sidebar.header("📁 1. 資料上傳")
 rain_file = st.sidebar.file_uploader("上傳雨量資料 (Excel/CSV)", type=["xlsx", "xls", "csv"])
 hobo_file = st.sidebar.file_uploader("上傳水位資料 (CSV)", type=["csv"])
@@ -74,27 +74,24 @@ if rain_file and hobo_file:
         hobo_val_col = st.sidebar.selectbox("💧 水位 - 數值欄位", hobo_cols, index=def_hobo_val)
 
         st.sidebar.markdown("---")
-        st.sidebar.header("⚙️ 3. 模型參數設定")
+        st.sidebar.header("⚙️ 3. 模型特徵設定")
         model_choice = st.sidebar.selectbox("選擇預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
         rolling_windows = st.sidebar.multiselect(
             "選擇降雨累積天數 (特徵工程)", 
-            options=[1, 3, 5, 7, 14, 20, 30, 60], 
-            default=[1, 3, 7, 14, 30]
+            options=[1, 3, 5, 7, 14, 20, 30, 60, 90], 
+            default=[3, 7, 14, 30, 60] # 加入更長期的記憶
         )
         
-        st.sidebar.info(
-            "💡 **為什麼要設定累積天數？**\n\n"
-            "地下水位的升降有「延遲效應」，不僅受當天雨量影響，還受過去幾週的降雨影響。勾選天數可讓 AI 學習這層遲滯關係。\n\n"
-            "🎯 **建議設定值：**\n"
-            "- **淺層/反應快：** `1, 3, 5, 7`\n"
-            "- **深層/反應慢：** `14, 30, 60`\n"
-            "- **萬用推薦 (預設)：** `1, 3, 7, 14, 30`"
+        st.sidebar.markdown("---")
+        st.sidebar.header("🎛️ 4. 預測平滑化 (消除鋸齒)")
+        smoothing_days = st.sidebar.slider(
+            "平滑天數 (移動平均)", 
+            min_value=1, max_value=30, value=7, 
+            help="數值越大，模擬的紅色曲線越平滑，越符合地下水緩慢消退的特性。"
         )
 
         st.sidebar.markdown("---")
-        st.sidebar.header("🗓️ 4. 補遺時間區間")
-        st.sidebar.write("請透過日曆選取您想進行 AI 補遺的起訖日期：")
-        
+        st.sidebar.header("🗓️ 5. 補遺時間區間")
         default_start = datetime.date(2018, 1, 1)
         default_end = datetime.date.today()
         impute_date_range = st.sidebar.date_input(
@@ -102,7 +99,7 @@ if rain_file and hobo_file:
             value=(default_start, default_end)
         )
         
-        validation_mode = st.sidebar.checkbox("🧪 啟動驗證模式 (隱藏所選區間的實際資料，測試 AI 盲測準確度)", value=False)
+        validation_mode = st.sidebar.checkbox("🧪 啟動驗證模式 (隱藏實際資料測試準確度)", value=False)
 
         if st.button("🚀 確認無誤，開始執行模擬預測"):
             if len(impute_date_range) != 2:
@@ -111,7 +108,7 @@ if rain_file and hobo_file:
                 
             start_date, end_date = impute_date_range
 
-            with st.spinner("正在清洗資料與訓練模型中..."):
+            with st.spinner("正在融合時間特徵與訓練模型中..."):
                 
                 # --- 處理雨量與水位 ---
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
@@ -128,20 +125,34 @@ if rain_file and hobo_file:
                 hobo_df = hobo_df.dropna(subset=['Date']).set_index('Date')
                 hobo_daily = hobo_df.resample('D').mean()
                 
-                # --- 資料合併與特徵工程 ---
+                # --- 資料合併 ---
                 df = pd.merge(rain_daily, hobo_daily, left_index=True, right_index=True, how='outer')
                 
+                # 🌟 優化 1：加入季節與時間特徵
+                df['Month'] = df.index.month
+                df['DayOfYear'] = df.index.dayofyear
+                
+                # 計算降雨累積特徵
                 for window in rolling_windows:
                     df[f'Rain_{window}D_Sum'] = df['Rainfall'].rolling(window=window, min_periods=1).sum()
                 
-                df_model = df.dropna(subset=[f'Rain_{w}D_Sum' for w in rolling_windows])
+                # 準備特徵清單
+                features = [f'Rain_{w}D_Sum' for w in rolling_windows] + ['Month', 'DayOfYear']
                 
+                df_model = df.dropna(subset=[f'Rain_{w}D_Sum' for w in rolling_windows])
                 original_df = df_model.copy()
                 
+                # 處理驗證模式的遮蔽
                 if validation_mode:
                     mask = (df_model.index.date >= start_date) & (df_model.index.date <= end_date)
                     df_model.loc[mask, 'WaterLevel'] = np.nan
                 
+                # 🌟 優化 2：加入線性基準線特徵 (Interpolation Base Trend)
+                # 這會將遺失區間的頭尾用直線連起來，給 AI 一個基準錨點
+                df_model['Base_Trend'] = df_model['WaterLevel'].interpolate(method='time').bfill().ffill()
+                features.append('Base_Trend')
+                
+                # 分離訓練集與預測集
                 train_data = df_model.dropna(subset=['WaterLevel'])
                 all_predict_data = df_model[df_model['WaterLevel'].isna()]
                 predict_data = all_predict_data.loc[str(start_date) : str(end_date)]
@@ -154,21 +165,27 @@ if rain_file and hobo_file:
                     st.stop()
 
                 # --- 訓練與預測 ---
-                features = [f'Rain_{w}D_Sum' for w in rolling_windows]
                 X_train = train_data[features]
                 y_train = train_data['WaterLevel']
                 X_predict = predict_data[features]
                 
                 if "隨機森林" in model_choice:
-                    model = RandomForestRegressor(n_estimators=100, random_state=42)
+                    model = RandomForestRegressor(n_estimators=150, max_depth=15, random_state=42)
                 else:
                     model = LinearRegression()
                     
                 model.fit(X_train, y_train)
                 predicted_levels = model.predict(X_predict)
                 
+                # 將預測結果填回
                 predict_data_copy = predict_data.copy()
                 predict_data_copy['WaterLevel_Simulated'] = predicted_levels
+                
+                # 🌟 優化 3：預測結果平滑化濾波
+                if smoothing_days > 1:
+                    predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
+                        window=smoothing_days, min_periods=1, center=True
+                    ).mean()
                 
                 if validation_mode:
                     val_compare = pd.DataFrame({
@@ -178,18 +195,18 @@ if rain_file and hobo_file:
                     
                     if len(val_compare) > 0:
                         mae = np.abs(val_compare['Actual'] - val_compare['Predicted']).mean()
-                        st.success(f"**🧪 盲測驗證完成！** 測試天數：`{len(val_compare)}` 天 │ AI 預測與實際水位的平均誤差為：**{mae:.3f} 公尺**")
+                        st.success(f"**🧪 盲測驗證完成！** 測試天數：`{len(val_compare)}` 天 │ 平均誤差：**{mae:.3f} 公尺**")
                     else:
-                        st.warning("所選區間內原本就沒有實際水位資料，無法計算誤差，退回一般補遺模式。")
+                        st.warning("所選區間內原本就沒有實際水位資料，無法計算誤差。")
                 else:
-                    st.success(f"**✅ 解析成功！** 訓練歷史 `{len(train_data)}` 天，將模擬補遺 `{len(predict_data)}` 天的水位 (區間: {start_date} ~ {end_date})。")
+                    st.success(f"**✅ 模擬完成！** 訓練歷史 `{len(train_data)}` 天，成功補遺 `{len(predict_data)}` 天的水位。")
                 
                 final_df = original_df.copy()
                 final_df['Simulated'] = False
                 final_df['WaterLevel_Simulated'] = np.nan
                 final_df.loc[predict_data_copy.index, 'WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated']
                 
-                # --- 繪製上下分離子圖表 (Subplots) ---
+                # --- 繪製上下分離子圖表 ---
                 st.markdown("### 📈 地下水位與雨量動態圖")
                 
                 fig = make_subplots(
@@ -200,24 +217,24 @@ if rain_file and hobo_file:
                     subplot_titles=("地下水位變化", "日降雨量")
                 )
                 
-                # 🎨 【視覺優化 1】實際觀測水位：改用 60% 透明度的藍色，退為背景參考線
+                # 實際觀測水位
                 actual_mask = final_df['WaterLevel'].notna()
                 fig.add_trace(go.Scatter(
                     x=final_df[actual_mask].index, 
                     y=final_df.loc[actual_mask, 'WaterLevel'], 
                     mode='lines', 
                     name='實際觀測水位', 
-                    line=dict(color='rgba(31, 119, 180, 0.5)', width=2.5) # 半透明藍色
+                    line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5) # 調低透明度作為底色
                 ), row=1, col=1)
                 
-                # 🎨 【視覺優化 2】AI 模擬水位：取消虛線，改用高對比、無透明度的亮橘紅實線
+                # AI 模擬水位
                 sim_mask = final_df['WaterLevel_Simulated'].notna()
                 fig.add_trace(go.Scatter(
                     x=final_df[sim_mask].index, 
                     y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
                     mode='lines', 
                     name='AI 模擬補遺水位', 
-                    line=dict(color='#FF4B4B', width=2) # 飽和亮橘紅色實線
+                    line=dict(color='#FF4B4B', width=2) # 高對比實線
                 ), row=1, col=1)
                 
                 fig.add_trace(go.Bar(x=final_df.index, y=final_df['Rainfall'], 
@@ -259,7 +276,7 @@ if rain_file and hobo_file:
                 st.download_button(
                     label="📥 下載完整資料集 (含模擬資料).csv",
                     data=csv_bytes,
-                    file_name="waterlevel_simulated.csv",
+                    file_name="waterlevel_simulated_smoothed.csv",
                     mime="text/csv"
                 )
     except Exception as e:
