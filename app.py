@@ -21,26 +21,28 @@ def load_raw_data(file):
         df = pd.read_excel(file)
     return df
 
-# --- 🛠️ 終極版時間格式統一器 (解決所有版本衝突與秒數斷層) ---
-def normalize_date_string(s):
-    s = str(s).strip()
-    # 1. 替換掉礙事的中文字
-    s = s.replace('時', ':').replace('分', ':').replace('秒', '')
-    s = s.replace('上午', 'AM ').replace('下午', 'PM ')
-    
-    if s in ('nan', 'NaT', 'None', ''):
+# --- 🛠️ 1. 終極版時間格式統一器 ---
+def clean_and_parse_dates(date_series):
+    def normalize_date_string(s):
+        # 移除多餘引號與中文時間單位
+        s = str(s).strip().replace('"', '').replace("'", "")
+        s = s.replace('時', ':').replace('分', ':').replace('秒', '')
+        s = s.replace('上午', 'AM ').replace('下午', 'PM ')
+        if s in ('nan', 'NaT', 'None', '', 'NaN'):
+            return None
+        # 如果只有一個冒號(代表沒有秒數)，強制補齊秒數以統一格式
+        if s.count(':') == 1:
+            s += ':00'
         return s
         
-    # 2. 關鍵防呆：如果字串裡只有一個冒號 (代表只有時、分，缺秒數)
-    if s.count(':') == 1:
-        s += ':00'  # 強制補上秒數，確保全檔案格式統一
-        
-    return s
-
-def clean_and_parse_dates(date_series):
-    # 先統一字串格式，再交給 pandas 轉換，完全避開 format='mixed' 的版本問題
     normalized_series = date_series.apply(normalize_date_string)
     return pd.to_datetime(normalized_series, errors='coerce')
+
+# --- 🛠️ 2. 強效數字萃取器 (過濾文字與單位) ---
+def clean_and_parse_numbers(num_series):
+    # 使用正則表達式強制萃取出帶有正負號與小數點的純數字，過濾掉 (m, mm, N/A) 等雜訊
+    extracted = num_series.astype(str).str.extract(r'([-+]?\d*\.?\d+)')[0]
+    return pd.to_numeric(extracted, errors='coerce')
 
 # --- 側邊欄：檔案上傳 ---
 st.sidebar.header("📁 1. 資料上傳")
@@ -55,16 +57,14 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("🎯 2. 欄位對應設定")
         
-        # --- 雨量欄位自動預選 ---
         rain_cols = [str(c) for c in rain_df_raw.columns.tolist()]
-        # 強制優先尋找 Time.1 (這欄才有 2026 年的資料)
+        # 強制優先尋找 Time.1
         def_rain_date = next((i for i, c in enumerate(rain_cols) if c == 'Time.1'), 0)
         def_rain_val = next((i for i, c in enumerate(rain_cols) if 'R1' in c), min(1, len(rain_cols)-1))
         
-        rain_date_col = st.sidebar.selectbox("🌧️ 雨量 - 日期欄位 (請選 Time.1)", rain_cols, index=def_rain_date)
-        rain_val_col = st.sidebar.selectbox("🌧️ 雨量 - 數值欄位 (請選 R1)", rain_cols, index=def_rain_val)
+        rain_date_col = st.sidebar.selectbox("🌧️ 雨量 - 日期欄位 (建議選 Time.1)", rain_cols, index=def_rain_date)
+        rain_val_col = st.sidebar.selectbox("🌧️ 雨量 - 數值欄位 (建議選 R1)", rain_cols, index=def_rain_val)
 
-        # --- 水位欄位自動預選 ---
         hobo_cols = [str(c) for c in hobo_df_raw.columns.tolist()]
         def_hobo_date = 0
         def_hobo_val = min(1, len(hobo_cols)-1)
@@ -88,18 +88,20 @@ if rain_file and hobo_file:
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
                 rain_df.columns = ['Date', 'Rainfall']
                 rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) 
+                rain_df['Rainfall'] = clean_and_parse_numbers(rain_df['Rainfall']) # 啟用數字萃取器
                 rain_df = rain_df.dropna(subset=['Date'])
+                
                 rain_df.set_index('Date', inplace=True)
-                rain_df['Rainfall'] = pd.to_numeric(rain_df['Rainfall'], errors='coerce') 
                 rain_daily = rain_df.resample('D').sum()
 
                 # --- 處理水位資料 ---
                 hobo_df = hobo_df_raw[[hobo_date_col, hobo_val_col]].copy()
                 hobo_df.columns = ['Date', 'WaterLevel']
                 hobo_df['Date'] = clean_and_parse_dates(hobo_df['Date'])
+                hobo_df['WaterLevel'] = clean_and_parse_numbers(hobo_df['WaterLevel']) # 啟用數字萃取器
                 hobo_df = hobo_df.dropna(subset=['Date'])
+                
                 hobo_df.set_index('Date', inplace=True)
-                hobo_df['WaterLevel'] = pd.to_numeric(hobo_df['WaterLevel'], errors='coerce')
                 hobo_daily = hobo_df.resample('D').mean()
                 
                 # --- 資料合併與特徵工程 ---
@@ -113,16 +115,38 @@ if rain_file and hobo_file:
                 train_data = df_model.dropna(subset=['WaterLevel'])
                 predict_data = df_model[df_model['WaterLevel'].isna()]
                 
-                st.markdown(f"**📊 資料統計：** 訓練用歷史天數 `{len(train_data)}` 天 │ 待模擬補遺天數 `{len(predict_data)}` 天")
-                
+                # --- 🚨 自動除錯診斷儀表板 ---
                 if len(train_data) == 0:
-                    st.error("❌ 找不到雨量與水位重疊的時間段！")
+                    st.error("❌ 找不到雨量與水位重疊的時間段！請參考下方診斷報告尋找原因：")
+                    st.markdown("### 🚨 資料解析診斷報告")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.info(f"**🌧️ 雨量資料 ({rain_val_col})**")
+                        st.write(f"- 成功解析**日期**: `{rain_df.index.notna().sum()}` 筆")
+                        st.write(f"- 成功解析**數值**: `{rain_df['Rainfall'].notna().sum()}` 筆")
+                        if not rain_daily.dropna().empty:
+                            st.write(f"- 📅 有效時間範圍: `{rain_daily.dropna().index.min().date()}` ~ `{rain_daily.dropna().index.max().date()}`")
+                        else:
+                            st.write("- ⚠️ 嚴重警告：數值或時間全數失效！")
+                            
+                    with col2:
+                        st.info(f"**💧 水位資料 ({hobo_val_col})**")
+                        st.write(f"- 成功解析**日期**: `{hobo_df.index.notna().sum()}` 筆")
+                        st.write(f"- 成功解析**數值**: `{hobo_df['WaterLevel'].notna().sum()}` 筆")
+                        if not hobo_daily.dropna().empty:
+                            st.write(f"- 📅 有效時間範圍: `{hobo_daily.dropna().index.min().date()}` ~ `{hobo_daily.dropna().index.max().date()}`")
+                        else:
+                            st.write("- ⚠️ 嚴重警告：數值或時間全數失效！")
                     st.stop()
+                
                 if len(predict_data) == 0:
                     st.warning("⚠️ 所有雨量對應的日子都有水位資料，無需補遺！")
                     st.stop()
 
                 # --- 訓練與預測 ---
+                st.markdown(f"**📊 資料統計：** 成功匹配訓練歷史 `{len(train_data)}` 天 │ 待模擬補遺天數 `{len(predict_data)}` 天")
+                
                 features = [f'Rain_{w}D_Sum' for w in rolling_windows]
                 X_train = train_data[features]
                 y_train = train_data['WaterLevel']
@@ -185,4 +209,4 @@ if rain_file and hobo_file:
                     mime="text/csv"
                 )
     except Exception as e:
-        st.error(f"檔案解析失敗，錯誤訊息：{e}")
+        st.error(f"檔案解析發生不可預期的錯誤：{e}")
