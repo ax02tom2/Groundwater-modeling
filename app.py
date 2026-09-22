@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，選擇要補遺的區間，系統將利用機器學習模型自動模擬出遺失區段的水位數據。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用季節殘差與指數衰減模型，精準模擬出遺失區段的水位數據。")
 
 # --- 🛠️ 讀取檔案快取 ---
 @st.cache_data
@@ -74,20 +74,25 @@ if rain_file and hobo_file:
         hobo_val_col = st.sidebar.selectbox("💧 水位 - 數值欄位", hobo_cols, index=def_hobo_val)
 
         st.sidebar.markdown("---")
-        st.sidebar.header("⚙️ 3. 模型特徵設定")
-        model_choice = st.sidebar.selectbox("選擇預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
+        st.sidebar.header("⚙️ 3. 模型與物理特徵設定")
+        
+        # 加入對極端值更敏感的 Gradient Boosting
+        model_choice = st.sidebar.selectbox("選擇預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
+        
         rolling_windows = st.sidebar.multiselect(
-            "選擇降雨累積天數 (特徵工程)", 
-            options=[1, 3, 5, 7, 14, 20, 30, 60, 90], 
-            default=[7, 14, 30, 60, 90] # 調整預設值，讓 AI 看得更長遠
+            "地下水消退週期 (指數衰減 EWMA)", 
+            options=[3, 7, 14, 30, 60, 90, 180], 
+            default=[7, 14, 30, 60, 90],
+            help="不同地質的地下水消退速度不同。此參數將降雨量轉換為符合物理現實的指數衰減特徵。"
         )
         
         st.sidebar.markdown("---")
-        st.sidebar.header("🎛️ 4. 預測平滑化 (消除鋸齒)")
+        st.sidebar.header("🎛️ 4. 振幅與平滑校正")
+        calibrate_amplitude = st.sidebar.checkbox("開啟強制振幅校正 (解決預測幅度被壓縮的問題)", value=True)
+        
         smoothing_days = st.sidebar.slider(
-            "平滑天數 (移動平均)", 
-            min_value=1, max_value=30, value=7, 
-            help="數值越大，模擬的紅色曲線越平滑，越符合地下水緩慢消退的特性。"
+            "平滑天數 (消除雜訊)", 
+            min_value=1, max_value=30, value=7 
         )
 
         st.sidebar.markdown("---")
@@ -108,7 +113,7 @@ if rain_file and hobo_file:
                 
             start_date, end_date = impute_date_range
 
-            with st.spinner("正在融合時間特徵與訓練模型中..."):
+            with st.spinner("正在計算季節基準面與指數衰減特徵..."):
                 
                 # --- 處理雨量與水位 ---
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
@@ -125,58 +130,74 @@ if rain_file and hobo_file:
                 hobo_df = hobo_df.dropna(subset=['Date']).set_index('Date')
                 hobo_daily = hobo_df.resample('D').mean()
                 
-                # --- 資料合併 ---
                 df = pd.merge(rain_daily, hobo_daily, left_index=True, right_index=True, how='outer')
                 
-                # 🌟 正確的特徵工程：加入「一年中的哪一天 (季節週期)」
-                df['DayOfYear'] = df.index.dayofyear
-                
-                # 計算降雨累積特徵
-                for window in rolling_windows:
-                    df[f'Rain_{window}D_Sum'] = df['Rainfall'].rolling(window=window, min_periods=1).sum()
-                
-                # 準備特徵清單 (只有降雨跟季節，絕對不放任何會導致目標洩漏的水位相關資料)
-                features = [f'Rain_{w}D_Sum' for w in rolling_windows] + ['DayOfYear']
-                
-                df_model = df.dropna(subset=[f'Rain_{w}D_Sum' for w in rolling_windows])
-                original_df = df_model.copy()
-                
-                # 處理驗證模式的遮蔽
+                # --- 處理驗證模式的遮蔽 ---
+                original_df = df.copy()
                 if validation_mode:
-                    mask = (df_model.index.date >= start_date) & (df_model.index.date <= end_date)
-                    df_model.loc[mask, 'WaterLevel'] = np.nan
+                    mask = (df.index.date >= start_date) & (df.index.date <= end_date)
+                    df.loc[mask, 'WaterLevel'] = np.nan
                 
-                # 分離訓練集與預測集
-                train_data = df_model.dropna(subset=['WaterLevel'])
+                # 🌟 核心優化 1：建立歷史季節基準面 (Climatology Baseline)
+                train_only_df = df.dropna(subset=['WaterLevel'])
+                if len(train_only_df) > 0:
+                    daily_avg = train_only_df.groupby(train_only_df.index.dayofyear)['WaterLevel'].mean()
+                    df['Season_Base'] = df.index.dayofyear.map(daily_avg)
+                    df['Season_Base'] = df['Season_Base'].interpolate(limit_direction='both')
+                else:
+                    st.error("❌ 找不到可用於建立季節基準的歷史水位資料。")
+                    st.stop()
+                
+                # 🌟 核心優化 2：計算指數衰減雨量特徵 (EWMA)
+                features = []
+                for span in rolling_windows:
+                    feat_name = f'Rain_EWMA_{span}'
+                    df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
+                    features.append(feat_name)
+                
+                # 目標值改為預測「與季節基準面的落差 (殘差)」
+                df['Residual_Target'] = df['WaterLevel'] - df['Season_Base']
+                
+                df_model = df.dropna(subset=features)
+                
+                train_data = df_model.dropna(subset=['Residual_Target'])
                 all_predict_data = df_model[df_model['WaterLevel'].isna()]
                 predict_data = all_predict_data.loc[str(start_date) : str(end_date)]
                 
-                if len(train_data) == 0:
-                    st.error("❌ 找不到可用於訓練的時間段。")
-                    st.stop()
-                if len(predict_data) == 0:
-                    st.warning(f"⚠️ 選擇的區間 ({start_date} ~ {end_date}) 內沒有遺失資料。")
+                if len(train_data) == 0 or len(predict_data) == 0:
+                    st.warning("⚠️ 查無需要預測的區間，或無足夠訓練資料。")
                     st.stop()
 
-                # --- 訓練與預測 ---
+                # --- 模型訓練與預測 ---
                 X_train = train_data[features]
-                y_train = train_data['WaterLevel']
+                y_train = train_data['Residual_Target']
                 X_predict = predict_data[features]
                 
-                # 增強隨機森林的穩定度 (避免過度擬合)
-                if "隨機森林" in model_choice:
-                    model = RandomForestRegressor(n_estimators=200, max_depth=10, min_samples_split=5, random_state=42)
+                if "梯度提升樹" in model_choice:
+                    model = GradientBoostingRegressor(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42)
+                elif "隨機森林" in model_choice:
+                    model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
                 else:
                     model = LinearRegression()
                     
                 model.fit(X_train, y_train)
-                predicted_levels = model.predict(X_predict)
+                predicted_residuals = model.predict(X_predict)
                 
-                # 將預測結果填回
+                # 🌟 核心優化 3：強制振幅校正 (Amplitude Calibration)
+                if calibrate_amplitude and len(predicted_residuals) > 1:
+                    train_std = y_train.std()
+                    pred_std = predicted_residuals.std()
+                    if pred_std > 0:
+                        # 將預測結果的變異數放大到與歷史變異數一致
+                        predicted_residuals = predicted_residuals * (train_std / pred_std)
+                
+                # 最終預測水位 = 季節基準面 + 預測出來的落差
+                predicted_levels = predict_data['Season_Base'] + predicted_residuals
+                
                 predict_data_copy = predict_data.copy()
                 predict_data_copy['WaterLevel_Simulated'] = predicted_levels
                 
-                # 🌟 預測結果平滑化濾波
+                # 平滑化濾波
                 if smoothing_days > 1:
                     predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                         window=smoothing_days, min_periods=1, center=True
