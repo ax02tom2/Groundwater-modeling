@@ -10,7 +10,6 @@ st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wid
 st.title("💧 地下水位模擬與補遺工具")
 st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用機器學習模型自動模擬出遺失區段的水位數據。")
 
-# --- 快取：讀取原始檔案 ---
 @st.cache_data
 def load_raw_data(file):
     if file.name.endswith('.csv'):
@@ -22,26 +21,24 @@ def load_raw_data(file):
         df = pd.read_excel(file)
     return df
 
-# --- 🛠️ 強效日期清理函數 (解決中文時間格式報錯) ---
+# --- 🛠️ 終極版日期清理函數 ---
 def clean_and_parse_dates(date_series):
-    # 轉換為字串並替換常見的中文字元時間格式
     cleaned_dates = date_series.astype(str)\
         .str.replace('時', ':', regex=False)\
         .str.replace('分', ':', regex=False)\
         .str.replace('秒', '', regex=False)\
         .str.replace('上午', 'AM ', regex=False)\
         .str.replace('下午', 'PM ', regex=False)
-    # 嘗試轉換為時間格式，無法轉換的才會變成 NaT
-    return pd.to_datetime(cleaned_dates, errors='coerce')
+    
+    # 關鍵修正：加入 format='mixed' 允許時間格式中途改變 (有無秒數的差異)
+    return pd.to_datetime(cleaned_dates, format='mixed', errors='coerce')
 
-# --- 側邊欄：檔案上傳 ---
 st.sidebar.header("📁 1. 資料上傳")
 rain_file = st.sidebar.file_uploader("上傳雨量資料 (Excel/CSV)", type=["xlsx", "xls", "csv"])
 hobo_file = st.sidebar.file_uploader("上傳 HOBO 水位資料 (CSV)", type=["csv"])
 
 if rain_file and hobo_file:
     try:
-        # 讀取資料
         rain_df_raw = load_raw_data(rain_file)
         hobo_df_raw = load_raw_data(hobo_file)
 
@@ -49,15 +46,14 @@ if rain_file and hobo_file:
         st.sidebar.header("🎯 2. 欄位對應設定")
         st.sidebar.write("請確認系統抓取的欄位是否正確：")
 
-        # 讓使用者選擇雨量欄位
         rain_cols = [str(c) for c in rain_df_raw.columns.tolist()]
-        def_rain_date = next((i for i, c in enumerate(rain_cols) if 'Time.1' in c or 'Time' in c or '日期' in c), 0)
-        def_rain_val = next((i for i, c in enumerate(rain_cols) if 'R1' in c or '雨量' in c), min(1, len(rain_cols)-1))
+        # 讓系統優先尋找 Time.1 (才有 2026 年的資料)
+        def_rain_date = next((i for i, c in enumerate(rain_cols) if c == 'Time.1'), 0)
+        def_rain_val = next((i for i, c in enumerate(rain_cols) if 'R1' in c), min(1, len(rain_cols)-1))
         
-        rain_date_col = st.sidebar.selectbox("🌧️ 雨量 - 日期欄位", rain_cols, index=def_rain_date)
-        rain_val_col = st.sidebar.selectbox("🌧️ 雨量 - 數值欄位", rain_cols, index=def_rain_val)
+        rain_date_col = st.sidebar.selectbox("🌧️ 雨量 - 日期欄位 (建議選 Time.1)", rain_cols, index=def_rain_date)
+        rain_val_col = st.sidebar.selectbox("🌧️ 雨量 - 數值欄位 (建議選 R1)", rain_cols, index=def_rain_val)
 
-        # 讓使用者選擇水位欄位
         hobo_cols = [str(c) for c in hobo_df_raw.columns.tolist()]
         def_hobo_date = 0
         def_hobo_val = min(1, len(hobo_cols)-1)
@@ -74,31 +70,27 @@ if rain_file and hobo_file:
             default=[1, 3, 7, 14, 30]
         )
 
-        # --- 新增執行按鈕 ---
         if st.button("🚀 確認欄位無誤，開始執行模擬預測"):
-            with st.spinner("正在清洗資料與訓練模型中... (已啟用強效日期修復機制)"):
-                # 處理雨量
+            with st.spinner("正在清洗資料與訓練模型中..."):
+                
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
                 rain_df.columns = ['Date', 'Rainfall']
-                rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) # 使用清理函數
+                rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) 
                 rain_df = rain_df.dropna(subset=['Date'])
                 rain_df.set_index('Date', inplace=True)
                 rain_df['Rainfall'] = pd.to_numeric(rain_df['Rainfall'], errors='coerce') 
                 rain_daily = rain_df.resample('D').sum()
 
-                # 處理水位
                 hobo_df = hobo_df_raw[[hobo_date_col, hobo_val_col]].copy()
                 hobo_df.columns = ['Date', 'WaterLevel']
-                hobo_df['Date'] = clean_and_parse_dates(hobo_df['Date']) # 使用清理函數
+                hobo_df['Date'] = clean_and_parse_dates(hobo_df['Date'])
                 hobo_df = hobo_df.dropna(subset=['Date'])
                 hobo_df.set_index('Date', inplace=True)
                 hobo_df['WaterLevel'] = pd.to_numeric(hobo_df['WaterLevel'], errors='coerce')
                 hobo_daily = hobo_df.resample('D').mean()
                 
-                # 合併
                 df = pd.merge(rain_daily, hobo_daily, left_index=True, right_index=True, how='outer')
                 
-                # 特徵工程
                 for window in rolling_windows:
                     df[f'Rain_{window}D_Sum'] = df['Rainfall'].rolling(window=window, min_periods=1).sum()
                 
@@ -110,13 +102,12 @@ if rain_file and hobo_file:
                 st.markdown(f"**📊 資料統計：** 訓練用歷史天數 `{len(train_data)}` 天 │ 待模擬補遺天數 `{len(predict_data)}` 天")
                 
                 if len(train_data) == 0:
-                    st.error("❌ 找不到雨量與水位重疊的時間段，無法訓練模型！請檢查日期格式是否正確解析。")
+                    st.error("❌ 找不到雨量與水位重疊的時間段！")
                     st.stop()
                 if len(predict_data) == 0:
-                    st.warning("⚠️ 所有雨量對應的日子都有水位資料，無需進行補遺！")
+                    st.warning("⚠️ 所有雨量對應的日子都有水位資料，無需補遺！")
                     st.stop()
 
-                # 模型訓練與預測
                 features = [f'Rain_{w}D_Sum' for w in rolling_windows]
                 X_train = train_data[features]
                 y_train = train_data['WaterLevel']
@@ -138,7 +129,6 @@ if rain_file and hobo_file:
                 final_df.loc[predict_data_copy.index, 'WaterLevel'] = predict_data_copy['WaterLevel_Simulated']
                 final_df.loc[predict_data_copy.index, 'Simulated'] = True
                 
-                # 繪圖
                 st.markdown("### 📈 地下水位歷史與模擬預測圖")
                 fig = go.Figure()
                 
@@ -163,7 +153,6 @@ if rain_file and hobo_file:
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # 下載
                 st.markdown("### 📥 下載模擬結果")
                 output_df = final_df[['Rainfall', 'WaterLevel', 'Simulated']].rename(
                     columns={'WaterLevel': 'WaterLevel(m)', 'Simulated': 'Is_Simulated_Data'}
@@ -180,5 +169,3 @@ if rain_file and hobo_file:
                 )
     except Exception as e:
         st.error(f"檔案解析失敗，錯誤訊息：{e}")
-else:
-    st.info("💡 請從左側面板上傳「雨量」與「地下水位」資料檔案以開始分析。")
