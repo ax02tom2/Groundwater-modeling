@@ -22,6 +22,18 @@ def load_raw_data(file):
         df = pd.read_excel(file)
     return df
 
+# --- 🛠️ 強效日期清理函數 (解決中文時間格式報錯) ---
+def clean_and_parse_dates(date_series):
+    # 轉換為字串並替換常見的中文字元時間格式
+    cleaned_dates = date_series.astype(str)\
+        .str.replace('時', ':', regex=False)\
+        .str.replace('分', ':', regex=False)\
+        .str.replace('秒', '', regex=False)\
+        .str.replace('上午', 'AM ', regex=False)\
+        .str.replace('下午', 'PM ', regex=False)
+    # 嘗試轉換為時間格式，無法轉換的才會變成 NaT
+    return pd.to_datetime(cleaned_dates, errors='coerce')
+
 # --- 側邊欄：檔案上傳 ---
 st.sidebar.header("📁 1. 資料上傳")
 rain_file = st.sidebar.file_uploader("上傳雨量資料 (Excel/CSV)", type=["xlsx", "xls", "csv"])
@@ -39,7 +51,6 @@ if rain_file and hobo_file:
 
         # 讓使用者選擇雨量欄位
         rain_cols = [str(c) for c in rain_df_raw.columns.tolist()]
-        # 嘗試自動尋找最可能的欄位
         def_rain_date = next((i for i, c in enumerate(rain_cols) if 'Time.1' in c or 'Time' in c or '日期' in c), 0)
         def_rain_val = next((i for i, c in enumerate(rain_cols) if 'R1' in c or '雨量' in c), min(1, len(rain_cols)-1))
         
@@ -65,20 +76,20 @@ if rain_file and hobo_file:
 
         # --- 新增執行按鈕 ---
         if st.button("🚀 確認欄位無誤，開始執行模擬預測"):
-            with st.spinner("正在清洗資料與訓練模型中..."):
+            with st.spinner("正在清洗資料與訓練模型中... (已啟用強效日期修復機制)"):
                 # 處理雨量
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
                 rain_df.columns = ['Date', 'Rainfall']
-                rain_df['Date'] = pd.to_datetime(rain_df['Date'], errors='coerce') # 強制轉為時間
+                rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) # 使用清理函數
                 rain_df = rain_df.dropna(subset=['Date'])
                 rain_df.set_index('Date', inplace=True)
-                rain_df['Rainfall'] = pd.to_numeric(rain_df['Rainfall'], errors='coerce') # 強制轉為數字，過濾掉表頭文字
+                rain_df['Rainfall'] = pd.to_numeric(rain_df['Rainfall'], errors='coerce') 
                 rain_daily = rain_df.resample('D').sum()
 
                 # 處理水位
                 hobo_df = hobo_df_raw[[hobo_date_col, hobo_val_col]].copy()
                 hobo_df.columns = ['Date', 'WaterLevel']
-                hobo_df['Date'] = pd.to_datetime(hobo_df['Date'], errors='coerce')
+                hobo_df['Date'] = clean_and_parse_dates(hobo_df['Date']) # 使用清理函數
                 hobo_df = hobo_df.dropna(subset=['Date'])
                 hobo_df.set_index('Date', inplace=True)
                 hobo_df['WaterLevel'] = pd.to_numeric(hobo_df['WaterLevel'], errors='coerce')
