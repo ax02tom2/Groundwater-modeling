@@ -10,27 +10,27 @@ st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wid
 st.title("💧 地下水位模擬與補遺工具")
 st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用機器學習模型自動模擬出遺失區段的水位數據。")
 
+# --- 🛠️ 1. 完美檔案讀取機制 (解決游標遺失讀不到資料的 Bug) ---
 @st.cache_data
-def load_raw_data(file):
-    if file.name.endswith('.csv'):
+def load_raw_data(file_bytes, file_name):
+    # 使用 io.BytesIO 確保每次讀取都是從頭開始，絕對不會漏掉資料
+    if file_name.endswith('.csv'):
         try:
-            df = pd.read_csv(file, encoding='utf-8')
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8')
         except UnicodeDecodeError:
-            df = pd.read_csv(file, encoding='big5')
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding='big5')
     else:
-        df = pd.read_excel(file)
+        df = pd.read_excel(io.BytesIO(file_bytes))
     return df
 
-# --- 🛠️ 1. 終極版時間格式統一器 ---
+# --- 🛠️ 2. 終極版時間格式統一器 ---
 def clean_and_parse_dates(date_series):
     def normalize_date_string(s):
-        # 移除多餘引號與中文時間單位
         s = str(s).strip().replace('"', '').replace("'", "")
         s = s.replace('時', ':').replace('分', ':').replace('秒', '')
         s = s.replace('上午', 'AM ').replace('下午', 'PM ')
         if s in ('nan', 'NaT', 'None', '', 'NaN'):
             return None
-        # 如果只有一個冒號(代表沒有秒數)，強制補齊秒數以統一格式
         if s.count(':') == 1:
             s += ':00'
         return s
@@ -38,9 +38,8 @@ def clean_and_parse_dates(date_series):
     normalized_series = date_series.apply(normalize_date_string)
     return pd.to_datetime(normalized_series, errors='coerce')
 
-# --- 🛠️ 2. 強效數字萃取器 (過濾文字與單位) ---
+# --- 🛠️ 3. 強效數字萃取器 (過濾文字與單位) ---
 def clean_and_parse_numbers(num_series):
-    # 使用正則表達式強制萃取出帶有正負號與小數點的純數字，過濾掉 (m, mm, N/A) 等雜訊
     extracted = num_series.astype(str).str.extract(r'([-+]?\d*\.?\d+)')[0]
     return pd.to_numeric(extracted, errors='coerce')
 
@@ -50,15 +49,20 @@ rain_file = st.sidebar.file_uploader("上傳雨量資料 (Excel/CSV)", type=["xl
 hobo_file = st.sidebar.file_uploader("上傳 HOBO 水位資料 (CSV)", type=["csv"])
 
 if rain_file and hobo_file:
+    # 防呆檢查
+    if rain_file.name == hobo_file.name:
+        st.error(f"❌ 檔案上傳錯誤：您在兩個上傳區都選擇了同一個檔案 (`{rain_file.name}`)！")
+        st.stop()
+
     try:
-        rain_df_raw = load_raw_data(rain_file)
-        hobo_df_raw = load_raw_data(hobo_file)
+        # ⚠️ 關鍵修正：傳遞檔案的 raw bytes (getvalue)，避免串流被消耗掉
+        rain_df_raw = load_raw_data(rain_file.getvalue(), rain_file.name)
+        hobo_df_raw = load_raw_data(hobo_file.getvalue(), hobo_file.name)
 
         st.sidebar.markdown("---")
         st.sidebar.header("🎯 2. 欄位對應設定")
         
         rain_cols = [str(c) for c in rain_df_raw.columns.tolist()]
-        # 強制優先尋找 Time.1
         def_rain_date = next((i for i, c in enumerate(rain_cols) if c == 'Time.1'), 0)
         def_rain_val = next((i for i, c in enumerate(rain_cols) if 'R1' in c), min(1, len(rain_cols)-1))
         
@@ -88,9 +92,8 @@ if rain_file and hobo_file:
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
                 rain_df.columns = ['Date', 'Rainfall']
                 rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) 
-                rain_df['Rainfall'] = clean_and_parse_numbers(rain_df['Rainfall']) # 啟用數字萃取器
+                rain_df['Rainfall'] = clean_and_parse_numbers(rain_df['Rainfall']) 
                 rain_df = rain_df.dropna(subset=['Date'])
-                
                 rain_df.set_index('Date', inplace=True)
                 rain_daily = rain_df.resample('D').sum()
 
@@ -98,9 +101,8 @@ if rain_file and hobo_file:
                 hobo_df = hobo_df_raw[[hobo_date_col, hobo_val_col]].copy()
                 hobo_df.columns = ['Date', 'WaterLevel']
                 hobo_df['Date'] = clean_and_parse_dates(hobo_df['Date'])
-                hobo_df['WaterLevel'] = clean_and_parse_numbers(hobo_df['WaterLevel']) # 啟用數字萃取器
+                hobo_df['WaterLevel'] = clean_and_parse_numbers(hobo_df['WaterLevel']) 
                 hobo_df = hobo_df.dropna(subset=['Date'])
-                
                 hobo_df.set_index('Date', inplace=True)
                 hobo_daily = hobo_df.resample('D').mean()
                 
@@ -126,7 +128,7 @@ if rain_file and hobo_file:
                         st.write(f"- 成功解析**日期**: `{rain_df.index.notna().sum()}` 筆")
                         st.write(f"- 成功解析**數值**: `{rain_df['Rainfall'].notna().sum()}` 筆")
                         if not rain_daily.dropna().empty:
-                            st.write(f"- 📅 有效時間範圍: `{rain_daily.dropna().index.min().date()}` ~ `{rain_daily.dropna().index.max().date()}`")
+                            st.write(f"- 📅 有效範圍: `{rain_daily.dropna().index.min().date()}` ~ `{rain_daily.dropna().index.max().date()}`")
                         else:
                             st.write("- ⚠️ 嚴重警告：數值或時間全數失效！")
                             
@@ -135,7 +137,7 @@ if rain_file and hobo_file:
                         st.write(f"- 成功解析**日期**: `{hobo_df.index.notna().sum()}` 筆")
                         st.write(f"- 成功解析**數值**: `{hobo_df['WaterLevel'].notna().sum()}` 筆")
                         if not hobo_daily.dropna().empty:
-                            st.write(f"- 📅 有效時間範圍: `{hobo_daily.dropna().index.min().date()}` ~ `{hobo_daily.dropna().index.max().date()}`")
+                            st.write(f"- 📅 有效範圍: `{hobo_daily.dropna().index.min().date()}` ~ `{hobo_daily.dropna().index.max().date()}`")
                         else:
                             st.write("- ⚠️ 嚴重警告：數值或時間全數失效！")
                     st.stop()
@@ -145,7 +147,7 @@ if rain_file and hobo_file:
                     st.stop()
 
                 # --- 訓練與預測 ---
-                st.markdown(f"**📊 資料統計：** 成功匹配訓練歷史 `{len(train_data)}` 天 │ 待模擬補遺天數 `{len(predict_data)}` 天")
+                st.success(f"**✅ 解析成功！** 準備利用 `{len(train_data)}` 天的歷史資料，模擬補遺 `{len(predict_data)}` 天的水位。")
                 
                 features = [f'Rain_{w}D_Sum' for w in rolling_windows]
                 X_train = train_data[features]
