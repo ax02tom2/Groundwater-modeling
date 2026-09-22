@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用「高低頻訊號分離法」確保基準面不偏移，精準模擬遺失區段水位。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用純粹的機器學習模型模擬水位，並提供振幅放大與無縫接軌功能。")
 
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
@@ -73,25 +73,26 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("⚙️ 3. 模型與特徵設定")
         
-        model_choice = st.sidebar.selectbox("預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
-        
-        base_trend_window = st.sidebar.slider(
-            "低頻基流週期 (天)", 
-            min_value=7, max_value=90, value=30,
-            help="用於切分訊號。數值越大，跨越補遺區間的基礎水位趨勢線越平緩穩定。"
-        )
+        model_choice = st.sidebar.selectbox("預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
         
         rolling_windows = st.sidebar.multiselect(
-            "高頻降雨記憶 (特徵)", 
-            options=[3, 7, 14, 30, 60], 
-            default=[3, 7, 14, 30],
-            help="AI 預測突波殘差所依賴的短期降雨特徵。"
+            "降雨累積天數 (特徵)", 
+            options=[1, 3, 7, 14, 30, 60, 90, 180], 
+            default=[1, 3, 7, 14, 30, 60, 90]
         )
         
         st.sidebar.markdown("---")
-        st.sidebar.header("🎛️ 4. 振幅校正與平滑")
-        calibrate_amplitude = st.sidebar.checkbox("開啟 Z-Score 殘差振幅校正", value=True)
-        smoothing_days = st.sidebar.slider("最終平滑天數 (消除雜訊)", min_value=1, max_value=14, value=5)
+        st.sidebar.header("🎛️ 4. 預測結果後期微調 (Post-processing)")
+        
+        # 最直接暴力的解法：手動倍率放大
+        amplitude_multiplier = st.sidebar.slider(
+            "🚀 振幅放大器 (強制撐開波峰波谷)", 
+            min_value=1.0, max_value=5.0, value=1.5, step=0.1,
+            help="若覺得 AI 預測的線太平緩，可調高此倍率，強制將高低起伏的幅度拉大。"
+        )
+        
+        seamless_anchoring = st.sidebar.checkbox("🔗 開啟斷點無縫吸附 (對齊基準面)", value=True, help="強制將紅線頭尾連上藍線，解決整段平移的誤差。")
+        smoothing_days = st.sidebar.slider("消除鋸齒平滑天數", min_value=1, max_value=14, value=5)
 
         st.sidebar.markdown("---")
         st.sidebar.header("🗓️ 5. 補遺時間區間")
@@ -107,7 +108,7 @@ if rain_file and hobo_file:
                 
             start_date, end_date = impute_date_range
 
-            with st.spinner("正在執行高低頻訊號分離與模型訓練..."):
+            with st.spinner("正在回歸純粹的預測模型..."):
                 
                 # --- 資料清洗與對齊 ---
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
@@ -127,31 +128,22 @@ if rain_file and hobo_file:
                 df = pd.merge(rain_daily, hobo_daily, left_index=True, right_index=True, how='outer')
                 original_df = df.copy()
                 
-                # 處理驗證區間遮蔽
                 if validation_mode:
                     mask = (df.index.date >= start_date) & (df.index.date <= end_date)
                     df.loc[mask, 'WaterLevel'] = np.nan
                 
-                # 🌟 核心步驟 1：建立穩固的低頻基流 (Macro Trend Baseline)
-                # 使用移動平均算出基流，此時遺失區間內會產生 NaN
-                df['Macro_Trend'] = df['WaterLevel'].rolling(window=base_trend_window, min_periods=1, center=True).mean()
-                
-                # 對遺失區間的基流進行「時間線性內插」，將頭尾完美橋接
-                df['Macro_Trend'] = df['Macro_Trend'].interpolate(method='time').bfill().ffill()
-                
-                # 🌟 核心步驟 2：分離出高頻暴雨響應 (Residual Target)
-                # 這是 AI 唯一需要預測的目標：水位比基流高出/低了多少
-                df['Residual_Target'] = df['WaterLevel'] - df['Macro_Trend']
-                
-                # 產生降雨特徵
+                # 建立特徵：只用最單純的累積雨量與季節週期
                 features = []
-                for span in rolling_windows:
-                    feat_name = f'Rain_EWMA_{span}'
-                    df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
+                for window in rolling_windows:
+                    feat_name = f'Rain_{window}D_Sum'
+                    df[feat_name] = df['Rainfall'].rolling(window=window, min_periods=1).sum()
                     features.append(feat_name)
                 
+                df['DayOfYear'] = df.index.dayofyear
+                features.append('DayOfYear')
+                
                 df_model = df.dropna(subset=features)
-                train_data = df_model.dropna(subset=['Residual_Target'])
+                train_data = df_model.dropna(subset=['WaterLevel'])
                 predict_data = df_model.loc[str(start_date) : str(end_date)]
                 predict_data = predict_data[predict_data['WaterLevel'].isna()]
                 
@@ -161,38 +153,56 @@ if rain_file and hobo_file:
 
                 # --- 訓練與預測 ---
                 X_train = train_data[features]
-                y_train = train_data['Residual_Target']
+                y_train = train_data['WaterLevel']
                 X_predict = predict_data[features]
                 
-                if "梯度提升樹" in model_choice:
-                    model = GradientBoostingRegressor(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42)
-                elif "隨機森林" in model_choice:
-                    model = RandomForestRegressor(n_estimators=150, max_depth=10, random_state=42)
+                if "隨機森林" in model_choice:
+                    model = RandomForestRegressor(n_estimators=200, random_state=42)
                 else:
                     model = LinearRegression()
                     
                 model.fit(X_train, y_train)
-                predicted_residuals = model.predict(X_predict)
+                predicted_levels = model.predict(X_predict)
                 
-                # 振幅校正 (只針對殘差突波進行校正)
-                if calibrate_amplitude and len(predicted_residuals) > 1:
-                    train_std = y_train.std()
-                    pred_std = predicted_residuals.std()
-                    pred_mean = predicted_residuals.mean()
-                    if pred_std > 0:
-                        z_scores = (predicted_residuals - pred_mean) / pred_std
-                        predicted_residuals = (z_scores * train_std) + y_train.mean()
-                
-                # 🌟 核心步驟 3：將預測出的暴雨殘差，疊加回完美橋接的基流上
-                predicted_levels = predict_data['Macro_Trend'] + predicted_residuals
+                # --- 後期微調 1：強制振幅放大 ---
+                if amplitude_multiplier > 1.0 and len(predicted_levels) > 0:
+                    pred_mean = predicted_levels.mean()
+                    # 以預測的平均值為中心，將波峰波谷上下拉開
+                    predicted_levels = pred_mean + (predicted_levels - pred_mean) * amplitude_multiplier
                 
                 predict_data_copy = predict_data.copy()
                 predict_data_copy['WaterLevel_Simulated'] = predicted_levels
                 
+                # 平滑化濾波
                 if smoothing_days > 1:
                     predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                         window=smoothing_days, min_periods=1, center=True
                     ).mean()
+                    
+                # --- 後期微調 2：斷點無縫吸附 ---
+                if seamless_anchoring and len(predict_data_copy) > 0:
+                    idx_start = predict_data_copy.index.min()
+                    idx_end = predict_data_copy.index.max()
+                    
+                    past_actuals = original_df.loc[:idx_start - pd.Timedelta(days=1), 'WaterLevel'].dropna()
+                    future_actuals = original_df.loc[idx_end + pd.Timedelta(days=1):, 'WaterLevel'].dropna()
+                    
+                    offset_start, offset_end = 0, 0
+                    
+                    # 計算預測線頭端與真實線尾端的落差
+                    if len(past_actuals) > 0:
+                        offset_start = past_actuals.iloc[-1] - predict_data_copy['WaterLevel_Simulated'].iloc[0]
+                        
+                    # 計算預測線尾端與真實線頭端的落差
+                    if len(future_actuals) > 0:
+                        offset_end = future_actuals.iloc[0] - predict_data_copy['WaterLevel_Simulated'].iloc[-1]
+                    elif len(past_actuals) > 0:
+                        offset_end = offset_start # 若未來無資料，保持水平平移
+                        
+                    n_steps = len(predict_data_copy)
+                    # 產生一個漸變的傾斜修正量加回去，確保頭尾 100% 貼合
+                    drift_correction = np.linspace(offset_start, offset_end, n_steps)
+                    predict_data_copy['WaterLevel_Simulated'] += drift_correction
                 
                 if validation_mode:
                     val_compare = pd.DataFrame({
@@ -223,12 +233,6 @@ if rain_file and hobo_file:
                 fig.add_trace(go.Scatter(
                     x=final_df[actual_mask].index, y=final_df.loc[actual_mask, 'WaterLevel'], 
                     mode='lines', name='實際觀測水位', line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5) 
-                ), row=1, col=1)
-                
-                # 畫出隱形的基準線 (供參考)
-                fig.add_trace(go.Scatter(
-                    x=predict_data_copy.index, y=predict_data_copy['Macro_Trend'], 
-                    mode='lines', name='低頻基流基準線 (隱藏錨點)', line=dict(color='gray', width=1, dash='dot') 
                 ), row=1, col=1)
                 
                 sim_mask = final_df['WaterLevel_Simulated'].notna()
