@@ -10,9 +10,8 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用季節殘差與指數衰減模型，精準模擬出遺失區段的水位數據。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用季節殘差與 Z-Score 分布校正，精準模擬出遺失區段的水位數據。")
 
-# --- 🛠️ 讀取檔案快取 ---
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
     if file_name.endswith('.csv'):
@@ -24,7 +23,6 @@ def load_raw_data(file_bytes, file_name):
         df = pd.read_excel(io.BytesIO(file_bytes))
     return df
 
-# --- 🛠️ 時間與數字清理函數 ---
 def clean_and_parse_dates(date_series):
     def normalize_date_string(s):
         s = str(s).strip().replace('"', '').replace("'", "")
@@ -42,14 +40,13 @@ def clean_and_parse_numbers(num_series):
     extracted = num_series.astype(str).str.extract(r'([-+]?\d*\.?\d+)')[0]
     return pd.to_numeric(extracted, errors='coerce')
 
-# --- 側邊欄設定 ---
 st.sidebar.header("📁 1. 資料上傳")
 rain_file = st.sidebar.file_uploader("上傳雨量資料 (Excel/CSV)", type=["xlsx", "xls", "csv"])
 hobo_file = st.sidebar.file_uploader("上傳水位資料 (CSV)", type=["csv"])
 
 if rain_file and hobo_file:
     if rain_file.name == hobo_file.name:
-        st.error(f"❌ 檔案上傳錯誤：您在兩個上傳區都選擇了同一個檔案 (`{rain_file.name}`)！")
+        st.error(f"❌ 檔案上傳錯誤：您在兩個上傳區都選擇了同一個檔案！")
         st.stop()
 
     try:
@@ -76,19 +73,19 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("⚙️ 3. 模型與物理特徵設定")
         
-        # 加入對極端值更敏感的 Gradient Boosting
         model_choice = st.sidebar.selectbox("選擇預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
         
+        # 🌟 加入 180 天與 365 天，讓 AI 捕捉長期地下水記憶
         rolling_windows = st.sidebar.multiselect(
-            "地下水消退週期 (指數衰減 EWMA)", 
-            options=[3, 7, 14, 30, 60, 90, 180], 
-            default=[7, 14, 30, 60, 90],
-            help="不同地質的地下水消退速度不同。此參數將降雨量轉換為符合物理現實的指數衰減特徵。"
+            "地下水消退週期 (降雨記憶時間)", 
+            options=[7, 14, 30, 60, 90, 180, 365], 
+            default=[14, 30, 60, 90, 180],
+            help="包含較長天數（如180, 365）可讓模型學會長期的枯水/豐水週期影響。"
         )
         
         st.sidebar.markdown("---")
         st.sidebar.header("🎛️ 4. 振幅與平滑校正")
-        calibrate_amplitude = st.sidebar.checkbox("開啟強制振幅校正 (解決預測幅度被壓縮的問題)", value=True)
+        calibrate_amplitude = st.sidebar.checkbox("開啟 Z-Score 強制振幅校正", value=True, help="強制將 AI 預測的波動幅度拉展至與歷史數據相符，解決預測幅度被壓縮的問題。")
         
         smoothing_days = st.sidebar.slider(
             "平滑天數 (消除雜訊)", 
@@ -113,9 +110,8 @@ if rain_file and hobo_file:
                 
             start_date, end_date = impute_date_range
 
-            with st.spinner("正在計算季節基準面與指數衰減特徵..."):
+            with st.spinner("正在計算特徵與訓練模型中..."):
                 
-                # --- 處理雨量與水位 ---
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
                 rain_df.columns = ['Date', 'Rainfall']
                 rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) 
@@ -132,13 +128,11 @@ if rain_file and hobo_file:
                 
                 df = pd.merge(rain_daily, hobo_daily, left_index=True, right_index=True, how='outer')
                 
-                # --- 處理驗證模式的遮蔽 ---
                 original_df = df.copy()
                 if validation_mode:
                     mask = (df.index.date >= start_date) & (df.index.date <= end_date)
                     df.loc[mask, 'WaterLevel'] = np.nan
                 
-                # 🌟 核心優化 1：建立歷史季節基準面 (Climatology Baseline)
                 train_only_df = df.dropna(subset=['WaterLevel'])
                 if len(train_only_df) > 0:
                     daily_avg = train_only_df.groupby(train_only_df.index.dayofyear)['WaterLevel'].mean()
@@ -148,16 +142,13 @@ if rain_file and hobo_file:
                     st.error("❌ 找不到可用於建立季節基準的歷史水位資料。")
                     st.stop()
                 
-                # 🌟 核心優化 2：計算指數衰減雨量特徵 (EWMA)
                 features = []
                 for span in rolling_windows:
                     feat_name = f'Rain_EWMA_{span}'
                     df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
                     features.append(feat_name)
                 
-                # 目標值改為預測「與季節基準面的落差 (殘差)」
                 df['Residual_Target'] = df['WaterLevel'] - df['Season_Base']
-                
                 df_model = df.dropna(subset=features)
                 
                 train_data = df_model.dropna(subset=['Residual_Target'])
@@ -168,7 +159,6 @@ if rain_file and hobo_file:
                     st.warning("⚠️ 查無需要預測的區間，或無足夠訓練資料。")
                     st.stop()
 
-                # --- 模型訓練與預測 ---
                 X_train = train_data[features]
                 y_train = train_data['Residual_Target']
                 X_predict = predict_data[features]
@@ -183,21 +173,23 @@ if rain_file and hobo_file:
                 model.fit(X_train, y_train)
                 predicted_residuals = model.predict(X_predict)
                 
-                # 🌟 核心優化 3：強制振幅校正 (Amplitude Calibration)
+                # 🌟 核心優化：Z-Score 分布對齊強制校正
                 if calibrate_amplitude and len(predicted_residuals) > 1:
                     train_std = y_train.std()
+                    train_mean = y_train.mean()
                     pred_std = predicted_residuals.std()
+                    pred_mean = predicted_residuals.mean()
+                    
                     if pred_std > 0:
-                        # 將預測結果的變異數放大到與歷史變異數一致
-                        predicted_residuals = predicted_residuals * (train_std / pred_std)
+                        # 將預測結果轉為標準常態分布 (Z-Score)，再投射回歷史真實的分布幅度中
+                        z_scores = (predicted_residuals - pred_mean) / pred_std
+                        predicted_residuals = (z_scores * train_std) + train_mean
                 
-                # 最終預測水位 = 季節基準面 + 預測出來的落差
                 predicted_levels = predict_data['Season_Base'] + predicted_residuals
                 
                 predict_data_copy = predict_data.copy()
                 predict_data_copy['WaterLevel_Simulated'] = predicted_levels
                 
-                # 平滑化濾波
                 if smoothing_days > 1:
                     predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                         window=smoothing_days, min_periods=1, center=True
@@ -222,7 +214,6 @@ if rain_file and hobo_file:
                 final_df['WaterLevel_Simulated'] = np.nan
                 final_df.loc[predict_data_copy.index, 'WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated']
                 
-                # --- 繪製上下分離子圖表 ---
                 st.markdown("### 📈 地下水位與雨量動態圖")
                 
                 fig = make_subplots(
@@ -267,7 +258,6 @@ if rain_file and hobo_file:
                 
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # --- 檔案下載 ---
                 st.markdown("### 📥 下載模擬結果")
                 
                 if validation_mode:
