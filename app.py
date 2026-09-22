@@ -76,17 +76,27 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("⚙️ 3. 模型參數設定")
         model_choice = st.sidebar.selectbox("選擇預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
+        
+        # --- 新增的說明區塊 ---
         rolling_windows = st.sidebar.multiselect(
             "選擇降雨累積天數 (特徵工程)", 
             options=[1, 3, 5, 7, 14, 20, 30, 60], 
             default=[1, 3, 7, 14, 30]
+        )
+        
+        st.sidebar.info(
+            "💡 **為什麼要設定累積天數？**\n\n"
+            "地下水位的升降有「延遲效應」，不僅受當天雨量影響，還受過去幾週的降雨影響。勾選天數可讓 AI 學習這層遲滯關係。\n\n"
+            "🎯 **建議設定值：**\n"
+            "- **淺層/反應快：** `1, 3, 5, 7`\n"
+            "- **深層/反應慢：** `14, 30, 60`\n"
+            "- **萬用推薦 (預設)：** `1, 3, 7, 14, 30` (兼顧短期與中長期，適用大多數地質)"
         )
 
         st.sidebar.markdown("---")
         st.sidebar.header("🗓️ 4. 補遺時間區間")
         st.sidebar.write("請透過日曆選取您想進行 AI 補遺的起訖日期：")
         
-        # 日曆區間選擇器 (預設起始為2018年，結束為今天)
         default_start = datetime.date(2018, 1, 1)
         default_end = datetime.date.today()
         impute_date_range = st.sidebar.date_input(
@@ -95,7 +105,6 @@ if rain_file and hobo_file:
         )
 
         if st.button("🚀 確認無誤，開始執行模擬預測"):
-            # 檢查使用者是否有完整選取起始與結束日期
             if len(impute_date_range) != 2:
                 st.warning("⚠️ 請在左側日曆中完整點選「開始日期」與「結束日期」。")
                 st.stop()
@@ -129,10 +138,7 @@ if rain_file and hobo_file:
                 
                 train_data = df_model.dropna(subset=['WaterLevel'])
                 
-                # 找出所有水位遺失的日子
                 all_predict_data = df_model[df_model['WaterLevel'].isna()]
-                
-                # 根據日曆選擇器，過濾出使用者真正想補遺的時間區間
                 predict_data = all_predict_data.loc[str(start_date) : str(end_date)]
                 
                 if len(train_data) == 0:
@@ -158,7 +164,6 @@ if rain_file and hobo_file:
                 model.fit(X_train, y_train)
                 predicted_levels = model.predict(X_predict)
                 
-                # 將預測結果填回
                 predict_data_copy = predict_data.copy()
                 predict_data_copy['WaterLevel_Simulated'] = predicted_levels
                 
@@ -170,37 +175,30 @@ if rain_file and hobo_file:
                 # --- 繪製上下分離子圖表 (Subplots) ---
                 st.markdown("### 📈 地下水位與雨量動態圖")
                 
-                # 建立上下兩層的圖表，共用 X 軸
                 fig = make_subplots(
                     rows=2, cols=1, 
                     shared_xaxes=True, 
                     vertical_spacing=0.08,
-                    row_heights=[0.7, 0.3], # 上方水位佔 70%，下方雨量佔 30%
+                    row_heights=[0.7, 0.3],
                     subplot_titles=("地下水位變化", "日降雨量")
                 )
                 
-                # [上半部] 實際觀測水位
                 actual_mask = final_df['Simulated'] == False
                 fig.add_trace(go.Scatter(x=final_df[actual_mask].index, y=final_df[actual_mask]['WaterLevel'], 
                                          mode='lines', name='實際觀測水位', line=dict(color='blue')),
                               row=1, col=1)
                 
-                # [上半部] AI 模擬補遺水位
                 sim_mask = final_df['Simulated'] == True
                 fig.add_trace(go.Scatter(x=final_df[sim_mask].index, y=final_df[sim_mask]['WaterLevel'], 
                                          mode='lines', name='AI 模擬補遺水位', line=dict(color='orange', dash='dot')),
                               row=1, col=1)
                 
-                # [下半部] 日雨量直條圖 (改為底部朝上的正常方向)
                 fig.add_trace(go.Bar(x=final_df.index, y=final_df['Rainfall'], 
                                      name='日雨量', marker_color='rgba(0, 191, 255, 0.7)'),
                               row=2, col=1)
 
-                # 設定 Y 軸 (水位反轉、雨量正常朝上)
                 fig.update_yaxes(title_text="地下水位 (m)", autorange="reversed", row=1, col=1)
                 fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
-                
-                # 設定 X 軸 (只在下方的雨量圖顯示範圍滑桿)
                 fig.update_xaxes(title_text="日期", row=2, col=1)
 
                 fig.update_layout(
