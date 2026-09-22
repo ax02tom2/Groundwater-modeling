@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用季節殘差與 Z-Score 分布校正，精準模擬出遺失區段的水位數據。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用季節殘差與無縫錨點校正，精準模擬出遺失區段的水位數據。")
 
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
@@ -75,17 +75,16 @@ if rain_file and hobo_file:
         
         model_choice = st.sidebar.selectbox("選擇預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
         
-        # 🌟 加入 180 天與 365 天，讓 AI 捕捉長期地下水記憶
         rolling_windows = st.sidebar.multiselect(
             "地下水消退週期 (降雨記憶時間)", 
             options=[7, 14, 30, 60, 90, 180, 365], 
-            default=[14, 30, 60, 90, 180],
-            help="包含較長天數（如180, 365）可讓模型學會長期的枯水/豐水週期影響。"
+            default=[14, 30, 60, 90, 180, 365]
         )
         
         st.sidebar.markdown("---")
         st.sidebar.header("🎛️ 4. 振幅與平滑校正")
-        calibrate_amplitude = st.sidebar.checkbox("開啟 Z-Score 強制振幅校正", value=True, help="強制將 AI 預測的波動幅度拉展至與歷史數據相符，解決預測幅度被壓縮的問題。")
+        calibrate_amplitude = st.sidebar.checkbox("開啟 Z-Score 強制振幅校正", value=True)
+        seamless_calibration = st.sidebar.checkbox("🔗 開啟無縫錨點校正 (強烈推薦)", value=True, help="強制將模擬曲線的頭尾，完美平移吸附到真實水位的斷點上，消除年度基準面漂移誤差。")
         
         smoothing_days = st.sidebar.slider(
             "平滑天數 (消除雜訊)", 
@@ -110,8 +109,9 @@ if rain_file and hobo_file:
                 
             start_date, end_date = impute_date_range
 
-            with st.spinner("正在計算特徵與訓練模型中..."):
+            with st.spinner("正在計算特徵與執行無縫錨點校正中..."):
                 
+                # --- 處理資料 ---
                 rain_df = rain_df_raw[[rain_date_col, rain_val_col]].copy()
                 rain_df.columns = ['Date', 'Rainfall']
                 rain_df['Date'] = clean_and_parse_dates(rain_df['Date']) 
@@ -139,7 +139,7 @@ if rain_file and hobo_file:
                     df['Season_Base'] = df.index.dayofyear.map(daily_avg)
                     df['Season_Base'] = df['Season_Base'].interpolate(limit_direction='both')
                 else:
-                    st.error("❌ 找不到可用於建立季節基準的歷史水位資料。")
+                    st.error("❌ 找不到歷史水位資料。")
                     st.stop()
                 
                 features = []
@@ -161,40 +161,63 @@ if rain_file and hobo_file:
 
                 X_train = train_data[features]
                 y_train = train_data['Residual_Target']
-                X_predict = predict_data[features]
                 
                 if "梯度提升樹" in model_choice:
-                    model = GradientBoostingRegressor(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42)
+                    model = GradientBoostingRegressor(n_estimators=250, max_depth=5, learning_rate=0.05, random_state=42)
                 elif "隨機森林" in model_choice:
                     model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
                 else:
                     model = LinearRegression()
                     
                 model.fit(X_train, y_train)
-                predicted_residuals = model.predict(X_predict)
                 
-                # 🌟 核心優化：Z-Score 分布對齊強制校正
-                if calibrate_amplitude and len(predicted_residuals) > 1:
+                # 對「整個時間軸」進行預測，以利後續的錨點計算
+                df_model['Raw_Pred_Residual'] = model.predict(df_model[features])
+                
+                if calibrate_amplitude and len(train_data) > 1:
                     train_std = y_train.std()
                     train_mean = y_train.mean()
-                    pred_std = predicted_residuals.std()
-                    pred_mean = predicted_residuals.mean()
-                    
+                    pred_std = df_model['Raw_Pred_Residual'].std()
+                    pred_mean = df_model['Raw_Pred_Residual'].mean()
                     if pred_std > 0:
-                        # 將預測結果轉為標準常態分布 (Z-Score)，再投射回歷史真實的分布幅度中
-                        z_scores = (predicted_residuals - pred_mean) / pred_std
-                        predicted_residuals = (z_scores * train_std) + train_mean
+                        df_model['Raw_Pred_Residual'] = ((df_model['Raw_Pred_Residual'] - pred_mean) / pred_std * train_std) + train_mean
                 
-                predicted_levels = predict_data['Season_Base'] + predicted_residuals
+                df_model['Full_Simulated'] = df_model['Season_Base'] + df_model['Raw_Pred_Residual']
                 
                 predict_data_copy = predict_data.copy()
-                predict_data_copy['WaterLevel_Simulated'] = predicted_levels
+                predict_data_copy['WaterLevel_Simulated'] = df_model.loc[predict_data_copy.index, 'Full_Simulated']
                 
+                # 平滑化濾波
                 if smoothing_days > 1:
                     predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                         window=smoothing_days, min_periods=1, center=True
                     ).mean()
+                    
+                # 🌟 核心優化：無縫接軌錨點校正 (Seamless Boundary Calibration)
+                if seamless_calibration and len(predict_data_copy) > 0:
+                    idx_start = predict_data_copy.index.min()
+                    idx_end = predict_data_copy.index.max()
+                    
+                    past_actuals = original_df.loc[:idx_start - pd.Timedelta(days=1), 'WaterLevel'].dropna()
+                    future_actuals = original_df.loc[idx_end + pd.Timedelta(days=1):, 'WaterLevel'].dropna()
+                    
+                    offset_start, offset_end = 0, 0
+                    
+                    if len(past_actuals) > 0:
+                        last_actual_idx = past_actuals.index[-1]
+                        offset_start = past_actuals.iloc[-1] - df_model.loc[last_actual_idx, 'Full_Simulated']
+                        
+                    if len(future_actuals) > 0:
+                        next_actual_idx = future_actuals.index[0]
+                        offset_end = future_actuals.iloc[0] - df_model.loc[next_actual_idx, 'Full_Simulated']
+                    elif len(past_actuals) > 0:
+                        offset_end = offset_start # 若未來無資料，保持水平偏移
+                        
+                    n_steps = len(predict_data_copy)
+                    drift_correction = np.linspace(offset_start, offset_end, n_steps)
+                    predict_data_copy['WaterLevel_Simulated'] += drift_correction
                 
+                # --- 驗證與結果呈現 ---
                 if validation_mode:
                     val_compare = pd.DataFrame({
                         'Actual': original_df.loc[predict_data_copy.index, 'WaterLevel'],
@@ -203,43 +226,34 @@ if rain_file and hobo_file:
                     
                     if len(val_compare) > 0:
                         mae = np.abs(val_compare['Actual'] - val_compare['Predicted']).mean()
-                        st.success(f"**🧪 盲測驗證完成！** 測試天數：`{len(val_compare)}` 天 │ 平均誤差：**{mae:.3f} 公尺**")
+                        st.success(f"**🧪 盲測驗證完成！** 測試天數：`{len(val_compare)}` 天 │ 平均誤差降至：**{mae:.3f} 公尺**")
                     else:
-                        st.warning("所選區間內原本就沒有實際水位資料，無法計算誤差。")
+                        st.warning("所選區間內無實際水位資料可供誤差計算。")
                 else:
-                    st.success(f"**✅ 模擬完成！** 訓練歷史 `{len(train_data)}` 天，成功補遺 `{len(predict_data)}` 天的水位。")
+                    st.success(f"**✅ 模擬完成！** 成功補遺 `{len(predict_data)}` 天的水位 (已套用無縫接軌校正)。")
                 
                 final_df = original_df.copy()
                 final_df['Simulated'] = False
                 final_df['WaterLevel_Simulated'] = np.nan
                 final_df.loc[predict_data_copy.index, 'WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated']
                 
+                # --- 繪製上下分離子圖表 ---
                 st.markdown("### 📈 地下水位與雨量動態圖")
-                
                 fig = make_subplots(
-                    rows=2, cols=1, 
-                    shared_xaxes=True, 
-                    vertical_spacing=0.08,
-                    row_heights=[0.7, 0.3],
-                    subplot_titles=("地下水位變化", "日降雨量")
+                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                    row_heights=[0.7, 0.3], subplot_titles=("地下水位變化", "日降雨量")
                 )
                 
                 actual_mask = final_df['WaterLevel'].notna()
                 fig.add_trace(go.Scatter(
-                    x=final_df[actual_mask].index, 
-                    y=final_df.loc[actual_mask, 'WaterLevel'], 
-                    mode='lines', 
-                    name='實際觀測水位', 
-                    line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5) 
+                    x=final_df[actual_mask].index, y=final_df.loc[actual_mask, 'WaterLevel'], 
+                    mode='lines', name='實際觀測水位', line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5) 
                 ), row=1, col=1)
                 
                 sim_mask = final_df['WaterLevel_Simulated'].notna()
                 fig.add_trace(go.Scatter(
-                    x=final_df[sim_mask].index, 
-                    y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
-                    mode='lines', 
-                    name='AI 模擬補遺水位', 
-                    line=dict(color='#FF4B4B', width=2) 
+                    x=final_df[sim_mask].index, y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
+                    mode='lines', name='AI 模擬補遺水位', line=dict(color='#FF4B4B', width=2) 
                 ), row=1, col=1)
                 
                 fig.add_trace(go.Bar(x=final_df.index, y=final_df['Rainfall'], 
@@ -249,39 +263,22 @@ if rain_file and hobo_file:
                 fig.update_yaxes(title_text="地下水位 (m)", autorange="reversed", row=1, col=1)
                 fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
                 fig.update_xaxes(title_text="日期", row=2, col=1)
-
-                fig.update_layout(
-                    height=750,
-                    hovermode="x unified",
-                    legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)')
-                )
+                fig.update_layout(height=750, hovermode="x unified", legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)'))
                 
                 st.plotly_chart(fig, use_container_width=True)
                 
                 st.markdown("### 📥 下載模擬結果")
-                
                 if validation_mode:
                     output_df = final_df[['Rainfall', 'WaterLevel', 'WaterLevel_Simulated']].rename(
-                        columns={'WaterLevel': 'Actual_WaterLevel(m)', 'WaterLevel_Simulated': 'Simulated_WaterLevel(m)'}
-                    )
+                        columns={'WaterLevel': 'Actual_WaterLevel(m)', 'WaterLevel_Simulated': 'Simulated_WaterLevel(m)'})
                 else:
                     merged_waterlevel = final_df['WaterLevel'].fillna(final_df['WaterLevel_Simulated'])
                     is_simulated = final_df['WaterLevel'].isna() & final_df['WaterLevel_Simulated'].notna()
-                    output_df = pd.DataFrame({
-                        'Rainfall': final_df['Rainfall'],
-                        'WaterLevel(m)': merged_waterlevel,
-                        'Is_Simulated_Data': is_simulated
-                    })
+                    output_df = pd.DataFrame({'Rainfall': final_df['Rainfall'], 'WaterLevel(m)': merged_waterlevel, 'Is_Simulated_Data': is_simulated})
                 
                 csv_buffer = io.StringIO()
                 output_df.to_csv(csv_buffer)
                 csv_bytes = csv_buffer.getvalue().encode('utf-8-sig')
-                
-                st.download_button(
-                    label="📥 下載完整資料集 (含模擬資料).csv",
-                    data=csv_bytes,
-                    file_name="waterlevel_simulated_smoothed.csv",
-                    mime="text/csv"
-                )
+                st.download_button(label="📥 下載完整資料集 (含模擬資料).csv", data=csv_bytes, file_name="waterlevel_simulated_smoothed.csv", mime="text/csv")
     except Exception as e:
         st.error(f"檔案解析發生不可預期的錯誤：{e}")
