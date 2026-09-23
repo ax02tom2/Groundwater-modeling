@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，調整參數即可**即時自動模擬**遺失區段的水位數據。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用「季節基準殘差法」精準模擬，並支援即時動態響應。")
 
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
@@ -75,9 +75,8 @@ if rain_file and hobo_file:
         
         model_choice = st.sidebar.selectbox("預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
         
-        # 🌟 找回最強物理特徵：包含 365 天長期記憶的 EWMA 選項
         rolling_windows = st.sidebar.multiselect(
-            "地下水消退週期 (降雨記憶時間)", 
+            "地下水消退週期 (指數衰減記憶)", 
             options=[7, 14, 30, 60, 90, 180, 365], 
             default=[14, 30, 60, 90, 180, 365]
         )
@@ -123,7 +122,7 @@ if rain_file and hobo_file:
             mask = (df.index.date >= start_date) & (df.index.date <= end_date)
             df.loc[mask, 'WaterLevel'] = np.nan
             
-        # 🌟 找回核心邏輯 1：計算歷史季節基準面 (Season Base)
+        # 🌟 建立歷史季節基準面
         train_only_df = df.dropna(subset=['WaterLevel'])
         if len(train_only_df) > 0:
             daily_avg = train_only_df.groupby(train_only_df.index.dayofyear)['WaterLevel'].mean()
@@ -133,14 +132,14 @@ if rain_file and hobo_file:
             st.error("❌ 找不到可用於建立季節基準的歷史水位資料。")
             st.stop()
         
-        # 🌟 找回核心邏輯 2：指數衰減 (EWMA)
+        # 🌟 計算指數衰減 (EWMA)
         features = []
         for span in rolling_windows:
             feat_name = f'Rain_EWMA_{span}'
             df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
             features.append(feat_name)
         
-        # 🌟 找回核心邏輯 3：目標改為預測殘差
+        # 🌟 目標改為預測殘差
         df['Residual_Target'] = df['WaterLevel'] - df['Season_Base']
         
         df_model = df.dropna(subset=features)
@@ -155,7 +154,6 @@ if rain_file and hobo_file:
         # --- 訓練與預測 ---
         X_train = train_data[features]
         y_train = train_data['Residual_Target']
-        X_predict = predict_data[features]
         
         if "梯度提升樹" in model_choice:
             model = GradientBoostingRegressor(n_estimators=250, max_depth=5, learning_rate=0.05, random_state=42)
@@ -165,23 +163,23 @@ if rain_file and hobo_file:
             model = LinearRegression()
             
         model.fit(X_train, y_train)
-        predicted_residuals = model.predict(X_predict)
         
-        # 🌟 找回核心邏輯 4：Z-Score 分布對齊強制校正
-        if calibrate_amplitude and len(predicted_residuals) > 1:
+        # 🌟 重大修正：對「全域時間軸」進行預測，以確保 Z-Score 母體變異數計算正確！
+        df_model['Raw_Pred_Residual'] = model.predict(df_model[features])
+        
+        if calibrate_amplitude and len(train_data) > 1:
             train_std = y_train.std()
             train_mean = y_train.mean()
-            pred_std = predicted_residuals.std()
-            pred_mean = predicted_residuals.mean()
+            pred_std = df_model['Raw_Pred_Residual'].std()
+            pred_mean = df_model['Raw_Pred_Residual'].mean()
             if pred_std > 0:
-                z_scores = (predicted_residuals - pred_mean) / pred_std
-                predicted_residuals = (z_scores * train_std) + train_mean
+                df_model['Raw_Pred_Residual'] = ((df_model['Raw_Pred_Residual'] - pred_mean) / pred_std * train_std) + train_mean
         
         # 預測水位 = 季節基準面 + 預測落差
-        predicted_levels = predict_data['Season_Base'] + predicted_residuals
+        df_model['Full_Simulated'] = df_model['Season_Base'] + df_model['Raw_Pred_Residual']
         
         predict_data_copy = predict_data.copy()
-        predict_data_copy['WaterLevel_Simulated'] = predicted_levels
+        predict_data_copy['WaterLevel_Simulated'] = df_model.loc[predict_data_copy.index, 'Full_Simulated']
         
         if smoothing_days > 1:
             predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
@@ -198,9 +196,12 @@ if rain_file and hobo_file:
             
             offset_start, offset_end = 0, 0
             if len(past_actuals) > 0:
-                offset_start = past_actuals.iloc[-1] - predict_data_copy['WaterLevel_Simulated'].iloc[0]
+                last_actual_idx = past_actuals.index[-1]
+                offset_start = past_actuals.iloc[-1] - df_model.loc[last_actual_idx, 'Full_Simulated']
+                
             if len(future_actuals) > 0:
-                offset_end = future_actuals.iloc[0] - predict_data_copy['WaterLevel_Simulated'].iloc[-1]
+                next_actual_idx = future_actuals.index[0]
+                offset_end = future_actuals.iloc[0] - df_model.loc[next_actual_idx, 'Full_Simulated']
             elif len(past_actuals) > 0:
                 offset_end = offset_start 
                 
@@ -259,11 +260,11 @@ if rain_file and hobo_file:
             hovertemplate='日雨量: %{y:.1f} mm<extra></extra>'
         ), row=2, col=1)
 
-        # 🌟 正常數學正向軸 (不反轉)
+        # 正常數學正向軸
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         
-        # 🌟 Plotly 游標正確去英文標頭解法 (保留真實時間軸，只改 hover 格式)
+        # Plotly 游標純數字格式
         fig.update_xaxes(title_text="日期", hoverformat="%Y-%m-%d", row=2, col=1)
         fig.update_xaxes(hoverformat="%Y-%m-%d", row=1, col=1)
         
