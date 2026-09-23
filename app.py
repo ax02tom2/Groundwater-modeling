@@ -12,6 +12,16 @@ st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wid
 st.title("💧 地下水位模擬與補遺工具")
 st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用物理指數衰減(EWMA)與週期特徵精準模擬水位。")
 
+# 🌟 新增：操作建議與注意事項 (使用折疊面板保持版面乾淨)
+with st.expander("💡 模擬工具使用建議與限制 (請點擊展開閱讀)"):
+    st.markdown("""
+    **⚙️ 專業操作指南與避坑建議：**
+    1. **最佳適用區間**：AI 最擅長處理 **數週至 3~4 個月內** 的短期資料缺失（如儀器斷電、損壞）。在此區間內物理衰減記憶猶存，準確度極高。
+    2. **長區間補遺技巧 (半年以上)**：若遇超長空窗期，建議**分段模擬**（區分豐/枯水期）。若長區間模擬時發現紅線出現極度不自然的傾斜，請嘗試 **關閉「無縫錨點校正」**，讓基準線回歸自然衰減。
+    3. **善用平滑與振幅抑制雜訊**：預測時間拉長時，模型易出現階梯狀微小震盪。可適度調高左側的 **「消除鋸齒平滑天數」(例如 7~14 天)** 來熨平雜訊；若波峰過度誇張，可適度調降「振幅放大器」。
+    4. **水文物理限制**：本模型純粹依賴「地表降雨記憶」與「季節週期」。若該區段曾發生**大規模人為抽水、上游攔截工程或極端旱災**導致深層含水層枯竭，皆屬 AI 無法預測之非降雨干擾，請依循專業工程經驗綜合判斷。
+    """)
+
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
     if file_name.endswith('.csv'):
@@ -135,7 +145,7 @@ if rain_file and hobo_file:
             df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
             features.append(feat_name)
         
-        # 2. 完美的季節週期特徵 (正餘弦編碼)，穩住長期基準面不崩跌
+        # 2. 季節週期特徵 (正餘弦編碼)
         df['DayOfYear'] = df.index.dayofyear
         df['sin_DOY'] = np.sin(2 * np.pi * df['DayOfYear'] / 365.25)
         df['cos_DOY'] = np.cos(2 * np.pi * df['DayOfYear'] / 365.25)
@@ -174,7 +184,7 @@ if rain_file and hobo_file:
         predict_data_copy = predict_data.copy()
         predict_data_copy['WaterLevel_Simulated'] = predicted_levels
         
-        # --- 後期微調 2：平滑化濾波 (可用來熨平微小決策樹誤差) ---
+        # --- 後期微調 2：平滑化濾波 ---
         if smoothing_days > 1:
             predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                 window=smoothing_days, min_periods=1, center=True
