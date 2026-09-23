@@ -75,7 +75,6 @@ if rain_file and hobo_file:
         
         model_choice = st.sidebar.selectbox("預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
         
-        # 🌟 保留最強的物理降雨衰減特徵
         rolling_windows = st.sidebar.multiselect(
             "地下水消退週期 (降雨記憶時間)", 
             options=[7, 14, 30, 60, 90, 180, 365], 
@@ -130,22 +129,14 @@ if rain_file and hobo_file:
             df.loc[mask, 'WaterLevel'] = np.nan
         
         features = []
-        # 1. 物理降雨特徵 (EWMA 指數衰減)
+        # 🌟 純淨物理特徵：只依賴 EWMA 降雨衰減，徹底拔除所有「時間/日期」干擾特徵
         for span in rolling_windows:
             feat_name = f'Rain_EWMA_{span}'
             df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
             features.append(feat_name)
         
-        # 🌟 2. 解決幽靈波峰的殺手鐧：正餘弦週期特徵 (Cyclical Encoding)
-        # 取代死板的「歷史同一天平均」，讓 AI 學習平滑的季節曲線
-        df['DayOfYear'] = df.index.dayofyear
-        df['sin_DOY'] = np.sin(2 * np.pi * df['DayOfYear'] / 365.25)
-        df['cos_DOY'] = np.cos(2 * np.pi * df['DayOfYear'] / 365.25)
-        features.extend(['sin_DOY', 'cos_DOY'])
-        
         df_model = df.dropna(subset=features)
         
-        # 🌟 預測目標：直接預測真實水位 (不再使用容易引發干擾的 Residual)
         train_data = df_model.dropna(subset=['WaterLevel'])
         predict_data = df_model.loc[str(start_date) : str(end_date)]
         predict_data = predict_data[predict_data['WaterLevel'].isna()]
@@ -254,11 +245,9 @@ if rain_file and hobo_file:
             hovertemplate='日雨量: %{y:.1f} mm<extra></extra>'
         ), row=2, col=1)
 
-        # 正常數學正向軸
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         
-        # Plotly 游標純數字格式 (移除英文標頭)
         fig.update_xaxes(title_text="日期", hoverformat="%Y-%m-%d", row=2, col=1)
         fig.update_xaxes(hoverformat="%Y-%m-%d", row=1, col=1)
         
