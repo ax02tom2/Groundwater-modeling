@@ -90,6 +90,7 @@ if rain_file and hobo_file:
         )
         
         smoothing_days = st.sidebar.slider("消除鋸齒平滑天數", min_value=1, max_value=14, value=5)
+        seamless_anchoring = st.sidebar.checkbox("🔗 開啟斷點無縫吸附 (對齊基準面)", value=True)
 
         st.sidebar.markdown("---")
         st.sidebar.header("🗓️ 5. 補遺時間區間")
@@ -169,6 +170,25 @@ if rain_file and hobo_file:
                 window=smoothing_days, min_periods=1, center=True
             ).mean()
         
+        if seamless_anchoring and len(predict_data_copy) > 0:
+            idx_start = predict_data_copy.index.min()
+            idx_end = predict_data_copy.index.max()
+            
+            past_actuals = original_df.loc[:idx_start - pd.Timedelta(days=1), 'WaterLevel'].dropna()
+            future_actuals = original_df.loc[idx_end + pd.Timedelta(days=1):, 'WaterLevel'].dropna()
+            
+            offset_start, offset_end = 0, 0
+            if len(past_actuals) > 0:
+                offset_start = past_actuals.iloc[-1] - predict_data_copy['WaterLevel_Simulated'].iloc[0]
+            if len(future_actuals) > 0:
+                offset_end = future_actuals.iloc[0] - predict_data_copy['WaterLevel_Simulated'].iloc[-1]
+            elif len(past_actuals) > 0:
+                offset_end = offset_start 
+                
+            n_steps = len(predict_data_copy)
+            drift_correction = np.linspace(offset_start, offset_end, n_steps)
+            predict_data_copy['WaterLevel_Simulated'] += drift_correction
+
         if validation_mode:
             val_compare = pd.DataFrame({
                 'Actual': original_df.loc[predict_data_copy.index, 'WaterLevel'],
@@ -185,9 +205,6 @@ if rain_file and hobo_file:
         final_df['WaterLevel_Simulated'] = np.nan
         final_df.loc[predict_data_copy.index, 'WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated']
         
-        # 🌟 關鍵技巧：將索引轉換為純字串格式（例如 "2018-10-05"），徹底消滅 Plotly 自動產生的英文日期標頭！
-        date_str_index = final_df.index.strftime('%Y-%m-%d')
-        
         # --- 繪圖與呈現 ---
         st.markdown("### 📈 地下水位與雨量動態圖")
         fig = make_subplots(
@@ -196,8 +213,9 @@ if rain_file and hobo_file:
         )
         
         actual_mask = final_df['WaterLevel'].notna()
+        # 恢復使用正常的 index (保持時間軸連續不壞掉)
         fig.add_trace(go.Scatter(
-            x=date_str_index[actual_mask], 
+            x=final_df[actual_mask].index, 
             y=final_df.loc[actual_mask, 'WaterLevel'], 
             mode='lines', 
             name='實際觀測水位', 
@@ -207,7 +225,7 @@ if rain_file and hobo_file:
         
         sim_mask = final_df['WaterLevel_Simulated'].notna()
         fig.add_trace(go.Scatter(
-            x=date_str_index[sim_mask], 
+            x=final_df[sim_mask].index, 
             y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
             mode='lines', 
             name='AI 模擬補遺水位', 
@@ -216,7 +234,7 @@ if rain_file and hobo_file:
         ), row=1, col=1)
         
         fig.add_trace(go.Bar(
-            x=date_str_index, 
+            x=final_df.index, 
             y=final_df['Rainfall'], 
             name='日雨量', 
             marker_color='rgba(0, 191, 255, 0.7)',
@@ -225,9 +243,11 @@ if rain_file and hobo_file:
 
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
-        fig.update_xaxes(title_text="日期", row=2, col=1)
         
-        # 🌟 將當前滑鼠所在的時間點資料直接作為 hoverbox 的頂部標頭顯示
+        # 🌟 正確解法在這裡：透過 hoverformat 強制將游標頂部的英文日期改成純數字！
+        fig.update_xaxes(title_text="日期", hoverformat="%Y-%m-%d", row=2, col=1)
+        fig.update_xaxes(hoverformat="%Y-%m-%d") 
+        
         fig.update_layout(
             height=750, 
             hovermode="x unified", 
