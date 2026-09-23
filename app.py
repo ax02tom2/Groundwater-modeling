@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，調整左側參數即可**即時自動模擬**遺失區段的水位數據。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用「季節基準殘差法」精準模擬，並支援即時動態響應。")
 
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
@@ -73,7 +73,7 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("⚙️ 3. 模型與特徵設定")
         
-        model_choice = st.sidebar.selectbox("預測模型", ["隨機森林 (Random Forest) - 推薦", "線性迴歸 (Linear Regression)"])
+        model_choice = st.sidebar.selectbox("預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
         
         rolling_windows = st.sidebar.multiselect(
             "降雨累積天數 (特徵)", 
@@ -84,13 +84,10 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("🎛️ 4. 預測結果後期微調")
         
-        amplitude_multiplier = st.sidebar.slider(
-            "🚀 振幅放大器 (強制撐開波峰波谷)", 
-            min_value=0.5, max_value=3.0, value=1.0, step=0.1
-        )
-        
+        # 🚀 恢復智慧型的 Z-Score 振幅校正，比手動調倍率更準確！
+        calibrate_amplitude = st.sidebar.checkbox("🚀 開啟 Z-Score 強制振幅校正", value=True, help="強制將 AI 預測的波動幅度拉展至與歷史數據相符，避免預測變平。")
+        seamless_anchoring = st.sidebar.checkbox("🔗 開啟斷點無縫吸附 (對齊基準面)", value=True, help="強制將紅線頭尾連上藍線，解決整段平移的誤差。")
         smoothing_days = st.sidebar.slider("消除鋸齒平滑天數", min_value=1, max_value=14, value=5)
-        seamless_anchoring = st.sidebar.checkbox("🔗 開啟斷點無縫吸附 (對齊基準面)", value=True)
 
         st.sidebar.markdown("---")
         st.sidebar.header("🗓️ 5. 補遺時間區間")
@@ -126,6 +123,16 @@ if rain_file and hobo_file:
         if validation_mode:
             mask = (df.index.date >= start_date) & (df.index.date <= end_date)
             df.loc[mask, 'WaterLevel'] = np.nan
+            
+        # 🌟 恢復強大邏輯 1：計算歷史季節基準面 (Season Base)
+        train_only_df = df.dropna(subset=['WaterLevel'])
+        if len(train_only_df) > 0:
+            daily_avg = train_only_df.groupby(train_only_df.index.dayofyear)['WaterLevel'].mean()
+            df['Season_Base'] = df.index.dayofyear.map(daily_avg)
+            df['Season_Base'] = df['Season_Base'].interpolate(limit_direction='both')
+        else:
+            st.error("❌ 找不到可用於建立季節基準的歷史水位資料。")
+            st.stop()
         
         features = []
         for window in rolling_windows:
@@ -136,8 +143,11 @@ if rain_file and hobo_file:
         df['DayOfYear'] = df.index.dayofyear
         features.append('DayOfYear')
         
+        # 🌟 恢復強大邏輯 2：目標改為預測「與季節基準面的落差 (殘差)」
+        df['Residual_Target'] = df['WaterLevel'] - df['Season_Base']
+        
         df_model = df.dropna(subset=features)
-        train_data = df_model.dropna(subset=['WaterLevel'])
+        train_data = df_model.dropna(subset=['Residual_Target'])
         predict_data = df_model.loc[str(start_date) : str(end_date)]
         predict_data = predict_data[predict_data['WaterLevel'].isna()]
         
@@ -147,20 +157,31 @@ if rain_file and hobo_file:
 
         # --- 訓練與預測 ---
         X_train = train_data[features]
-        y_train = train_data['WaterLevel']
+        y_train = train_data['Residual_Target']
         X_predict = predict_data[features]
         
-        if "隨機森林" in model_choice:
+        if "梯度提升樹" in model_choice:
+            model = GradientBoostingRegressor(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42)
+        elif "隨機森林" in model_choice:
             model = RandomForestRegressor(n_estimators=200, random_state=42)
         else:
             model = LinearRegression()
             
         model.fit(X_train, y_train)
-        predicted_levels = model.predict(X_predict)
+        predicted_residuals = model.predict(X_predict)
         
-        if amplitude_multiplier != 1.0 and len(predicted_levels) > 0:
-            pred_mean = predicted_levels.mean()
-            predicted_levels = pred_mean + (predicted_levels - pred_mean) * amplitude_multiplier
+        # 🌟 恢復強大邏輯 3：Z-Score 分布對齊強制校正 (保證振幅完美展開)
+        if calibrate_amplitude and len(predicted_residuals) > 1:
+            train_std = y_train.std()
+            train_mean = y_train.mean()
+            pred_std = predicted_residuals.std()
+            pred_mean = predicted_residuals.mean()
+            if pred_std > 0:
+                z_scores = (predicted_residuals - pred_mean) / pred_std
+                predicted_residuals = (z_scores * train_std) + train_mean
+        
+        # 預測水位 = 季節基準面 + 預測落差
+        predicted_levels = predict_data['Season_Base'] + predicted_residuals
         
         predict_data_copy = predict_data.copy()
         predict_data_copy['WaterLevel_Simulated'] = predicted_levels
@@ -170,6 +191,7 @@ if rain_file and hobo_file:
                 window=smoothing_days, min_periods=1, center=True
             ).mean()
         
+        # --- 斷點無縫吸附 (線性平移修正) ---
         if seamless_anchoring and len(predict_data_copy) > 0:
             idx_start = predict_data_copy.index.min()
             idx_end = predict_data_copy.index.max()
@@ -213,7 +235,6 @@ if rain_file and hobo_file:
         )
         
         actual_mask = final_df['WaterLevel'].notna()
-        # 恢復使用正常的 index (保持時間軸連續不壞掉)
         fig.add_trace(go.Scatter(
             x=final_df[actual_mask].index, 
             y=final_df.loc[actual_mask, 'WaterLevel'], 
@@ -241,12 +262,13 @@ if rain_file and hobo_file:
             hovertemplate='日雨量: %{y:.1f} mm<extra></extra>'
         ), row=2, col=1)
 
+        # 🌟 Y 軸維持正常的數學正向軸（不反轉），數字越負越在下方
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         
-        # 🌟 正確解法在這裡：透過 hoverformat 強制將游標頂部的英文日期改成純數字！
+        # 🌟 Plotly 游標 X 軸正確解法：保留原生日期的連續性，強制替換 hover 標頭格式
         fig.update_xaxes(title_text="日期", hoverformat="%Y-%m-%d", row=2, col=1)
-        fig.update_xaxes(hoverformat="%Y-%m-%d") 
+        fig.update_xaxes(hoverformat="%Y-%m-%d", row=1, col=1)
         
         fig.update_layout(
             height=750, 
