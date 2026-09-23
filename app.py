@@ -95,11 +95,10 @@ if rain_file and hobo_file:
         st.sidebar.markdown("---")
         st.sidebar.header("🗓️ 5. 補遺時間區間")
         default_start = datetime.date(2018, 1, 1)
-        default_end = datetime.date(2026, 9, 22) # 貼合你的資料時間範圍
+        default_end = datetime.date(2026, 9, 22)
         impute_date_range = st.sidebar.date_input("選擇區間 (開始與結束)", value=(default_start, default_end))
         validation_mode = st.sidebar.checkbox("🧪 啟動驗證模式 (隱藏實際資料測試準確度)", value=False)
 
-        # 🚀 移除原本的 st.button，改由參數變動直接在背景運算
         if len(impute_date_range) != 2:
             st.warning("⚠️ 請在左側日曆中完整點選「開始日期」與結束日期。")
             st.stop()
