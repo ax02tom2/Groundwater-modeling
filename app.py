@@ -86,10 +86,9 @@ if rain_file and hobo_file:
         
         amplitude_multiplier = st.sidebar.slider(
             "🚀 振幅放大器 (強制撐開波峰波谷)", 
-            min_value=1.0, max_value=5.0, value=1.5, step=0.1
+            min_value=0.5, max_value=3.0, value=1.0, step=0.1
         )
         
-        seamless_anchoring = st.sidebar.checkbox("🔗 開啟斷點無縫吸附 (對齊基準面)", value=True)
         smoothing_days = st.sidebar.slider("消除鋸齒平滑天數", min_value=1, max_value=14, value=5)
 
         st.sidebar.markdown("---")
@@ -158,7 +157,7 @@ if rain_file and hobo_file:
         model.fit(X_train, y_train)
         predicted_levels = model.predict(X_predict)
         
-        if amplitude_multiplier > 1.0 and len(predicted_levels) > 0:
+        if amplitude_multiplier != 1.0 and len(predicted_levels) > 0:
             pred_mean = predicted_levels.mean()
             predicted_levels = pred_mean + (predicted_levels - pred_mean) * amplitude_multiplier
         
@@ -169,25 +168,6 @@ if rain_file and hobo_file:
             predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                 window=smoothing_days, min_periods=1, center=True
             ).mean()
-            
-        if seamless_anchoring and len(predict_data_copy) > 0:
-            idx_start = predict_data_copy.index.min()
-            idx_end = predict_data_copy.index.max()
-            
-            past_actuals = original_df.loc[:idx_start - pd.Timedelta(days=1), 'WaterLevel'].dropna()
-            future_actuals = original_df.loc[idx_end + pd.Timedelta(days=1):, 'WaterLevel'].dropna()
-            
-            offset_start, offset_end = 0, 0
-            if len(past_actuals) > 0:
-                offset_start = past_actuals.iloc[-1] - predict_data_copy['WaterLevel_Simulated'].iloc[0]
-            if len(future_actuals) > 0:
-                offset_end = future_actuals.iloc[0] - predict_data_copy['WaterLevel_Simulated'].iloc[-1]
-            elif len(past_actuals) > 0:
-                offset_end = offset_start 
-                
-            n_steps = len(predict_data_copy)
-            drift_correction = np.linspace(offset_start, offset_end, n_steps)
-            predict_data_copy['WaterLevel_Simulated'] += drift_correction
         
         if validation_mode:
             val_compare = pd.DataFrame({
@@ -196,7 +176,7 @@ if rain_file and hobo_file:
             }).dropna()
             if len(val_compare) > 0:
                 mae = np.abs(val_compare['Actual'] - val_compare['Predicted']).mean()
-                st.success(f"**🧪 盲測驗證中** │ 目前設定平均誤差：**{mae:.3f} 公尺** (調整左側拉桿可即時看見誤差變化)")
+                st.success(f"**🧪 盲測驗證中** │ 目前設定平均誤差：**{mae:.3f} 公尺**")
         else:
             st.success(f"**⚡ 即時模擬中** │ 已自動補遺 `{len(predict_data)}` 天的水位。")
         
@@ -228,7 +208,8 @@ if rain_file and hobo_file:
                              name='日雨量', marker_color='rgba(0, 191, 255, 0.7)'),
                       row=2, col=1)
 
-        fig.update_yaxes(title_text="地下水位 (m)", autorange="reversed", row=1, col=1)
+        # 🌟 這裡移除了 autorange="reversed"，Y 軸改回正常的數學正向軸（越負越下面）
+        fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         fig.update_xaxes(title_text="日期", row=2, col=1)
         fig.update_layout(height=750, hovermode="x unified", legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)'))
