@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用「季節基準殘差法」精準模擬，並支援即時動態響應。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，調整參數即可**即時自動模擬**遺失區段的水位數據。")
 
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
@@ -71,22 +71,21 @@ if rain_file and hobo_file:
         hobo_val_col = st.sidebar.selectbox("💧 水位 - 數值欄位", hobo_cols, index=def_hobo_val)
 
         st.sidebar.markdown("---")
-        st.sidebar.header("⚙️ 3. 模型與特徵設定")
+        st.sidebar.header("⚙️ 3. 模型與物理特徵設定")
         
         model_choice = st.sidebar.selectbox("預測模型", ["梯度提升樹 (Gradient Boosting) - 推薦", "隨機森林 (Random Forest)", "線性迴歸 (Linear Regression)"])
         
+        # 🌟 找回最強物理特徵：包含 365 天長期記憶的 EWMA 選項
         rolling_windows = st.sidebar.multiselect(
-            "降雨累積天數 (特徵)", 
-            options=[1, 3, 7, 14, 30, 60, 90, 180, 365], 
-            default=[1, 3, 7, 14, 30, 60, 90, 180, 365]
+            "地下水消退週期 (降雨記憶時間)", 
+            options=[7, 14, 30, 60, 90, 180, 365], 
+            default=[14, 30, 60, 90, 180, 365]
         )
         
         st.sidebar.markdown("---")
-        st.sidebar.header("🎛️ 4. 預測結果後期微調")
-        
-        # 🚀 恢復智慧型的 Z-Score 振幅校正，比手動調倍率更準確！
-        calibrate_amplitude = st.sidebar.checkbox("🚀 開啟 Z-Score 強制振幅校正", value=True, help="強制將 AI 預測的波動幅度拉展至與歷史數據相符，避免預測變平。")
-        seamless_anchoring = st.sidebar.checkbox("🔗 開啟斷點無縫吸附 (對齊基準面)", value=True, help="強制將紅線頭尾連上藍線，解決整段平移的誤差。")
+        st.sidebar.header("🎛️ 4. 振幅與平滑校正")
+        calibrate_amplitude = st.sidebar.checkbox("🚀 開啟 Z-Score 強制振幅校正", value=True)
+        seamless_anchoring = st.sidebar.checkbox("🔗 開啟無縫錨點校正 (強烈推薦)", value=True)
         smoothing_days = st.sidebar.slider("消除鋸齒平滑天數", min_value=1, max_value=14, value=5)
 
         st.sidebar.markdown("---")
@@ -124,26 +123,24 @@ if rain_file and hobo_file:
             mask = (df.index.date >= start_date) & (df.index.date <= end_date)
             df.loc[mask, 'WaterLevel'] = np.nan
             
-        # 🌟 恢復強大邏輯 1：計算歷史季節基準面 (Season Base)
+        # 🌟 找回核心邏輯 1：計算歷史季節基準面 (Season Base)
         train_only_df = df.dropna(subset=['WaterLevel'])
         if len(train_only_df) > 0:
             daily_avg = train_only_df.groupby(train_only_df.index.dayofyear)['WaterLevel'].mean()
             df['Season_Base'] = df.index.dayofyear.map(daily_avg)
-            df['Season_Base'] = df['Season_Base'].interpolate(limit_direction='both')
+            df['Season_Base'] = df['Season_Base'].interpolate(limit_direction='both').bfill().ffill()
         else:
             st.error("❌ 找不到可用於建立季節基準的歷史水位資料。")
             st.stop()
         
+        # 🌟 找回核心邏輯 2：指數衰減 (EWMA)
         features = []
-        for window in rolling_windows:
-            feat_name = f'Rain_{window}D_Sum'
-            df[feat_name] = df['Rainfall'].rolling(window=window, min_periods=1).sum()
+        for span in rolling_windows:
+            feat_name = f'Rain_EWMA_{span}'
+            df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
             features.append(feat_name)
         
-        df['DayOfYear'] = df.index.dayofyear
-        features.append('DayOfYear')
-        
-        # 🌟 恢復強大邏輯 2：目標改為預測「與季節基準面的落差 (殘差)」
+        # 🌟 找回核心邏輯 3：目標改為預測殘差
         df['Residual_Target'] = df['WaterLevel'] - df['Season_Base']
         
         df_model = df.dropna(subset=features)
@@ -161,16 +158,16 @@ if rain_file and hobo_file:
         X_predict = predict_data[features]
         
         if "梯度提升樹" in model_choice:
-            model = GradientBoostingRegressor(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42)
+            model = GradientBoostingRegressor(n_estimators=250, max_depth=5, learning_rate=0.05, random_state=42)
         elif "隨機森林" in model_choice:
-            model = RandomForestRegressor(n_estimators=200, random_state=42)
+            model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
         else:
             model = LinearRegression()
             
         model.fit(X_train, y_train)
         predicted_residuals = model.predict(X_predict)
         
-        # 🌟 恢復強大邏輯 3：Z-Score 分布對齊強制校正 (保證振幅完美展開)
+        # 🌟 找回核心邏輯 4：Z-Score 分布對齊強制校正
         if calibrate_amplitude and len(predicted_residuals) > 1:
             train_std = y_train.std()
             train_mean = y_train.mean()
@@ -191,7 +188,7 @@ if rain_file and hobo_file:
                 window=smoothing_days, min_periods=1, center=True
             ).mean()
         
-        # --- 斷點無縫吸附 (線性平移修正) ---
+        # --- 斷點無縫吸附 ---
         if seamless_anchoring and len(predict_data_copy) > 0:
             idx_start = predict_data_copy.index.min()
             idx_end = predict_data_copy.index.max()
@@ -262,11 +259,11 @@ if rain_file and hobo_file:
             hovertemplate='日雨量: %{y:.1f} mm<extra></extra>'
         ), row=2, col=1)
 
-        # 🌟 Y 軸維持正常的數學正向軸（不反轉），數字越負越在下方
+        # 🌟 正常數學正向軸 (不反轉)
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         
-        # 🌟 Plotly 游標 X 軸正確解法：保留原生日期的連續性，強制替換 hover 標頭格式
+        # 🌟 Plotly 游標正確去英文標頭解法 (保留真實時間軸，只改 hover 格式)
         fig.update_xaxes(title_text="日期", hoverformat="%Y-%m-%d", row=2, col=1)
         fig.update_xaxes(hoverformat="%Y-%m-%d", row=1, col=1)
         
