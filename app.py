@@ -10,7 +10,7 @@ import datetime
 
 st.set_page_config(page_title="💧 地下水位模擬補遺工具", layout="wide")
 st.title("💧 地下水位模擬與補遺工具")
-st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用物理指數衰減(EWMA)與機器學習精準模擬水位。")
+st.write("上傳您的「雨量資料」與「地下水位資料」，系統將利用物理指數衰減(EWMA)與週期特徵精準模擬水位。")
 
 @st.cache_data
 def load_raw_data(file_bytes, file_name):
@@ -129,11 +129,17 @@ if rain_file and hobo_file:
             df.loc[mask, 'WaterLevel'] = np.nan
         
         features = []
-        # 🌟 純淨物理特徵：只依賴 EWMA 降雨衰減，徹底拔除所有「時間/日期」干擾特徵
+        # 1. 物理降雨特徵 (EWMA 指數衰減)
         for span in rolling_windows:
             feat_name = f'Rain_EWMA_{span}'
             df[feat_name] = df['Rainfall'].ewm(span=span, adjust=False).mean()
             features.append(feat_name)
+        
+        # 2. 完美的季節週期特徵 (正餘弦編碼)，穩住長期基準面不崩跌
+        df['DayOfYear'] = df.index.dayofyear
+        df['sin_DOY'] = np.sin(2 * np.pi * df['DayOfYear'] / 365.25)
+        df['cos_DOY'] = np.cos(2 * np.pi * df['DayOfYear'] / 365.25)
+        features.extend(['sin_DOY', 'cos_DOY'])
         
         df_model = df.dropna(subset=features)
         
@@ -168,7 +174,7 @@ if rain_file and hobo_file:
         predict_data_copy = predict_data.copy()
         predict_data_copy['WaterLevel_Simulated'] = predicted_levels
         
-        # --- 後期微調 2：平滑化濾波 ---
+        # --- 後期微調 2：平滑化濾波 (可用來熨平微小決策樹誤差) ---
         if smoothing_days > 1:
             predict_data_copy['WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated'].rolling(
                 window=smoothing_days, min_periods=1, center=True
