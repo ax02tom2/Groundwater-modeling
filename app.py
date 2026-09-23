@@ -193,26 +193,44 @@ if rain_file and hobo_file:
         )
         
         actual_mask = final_df['WaterLevel'].notna()
+        # 🌟 加入自定義 hovertemplate，將時間精確到年月日數字格式，並明確標示數值
         fig.add_trace(go.Scatter(
-            x=final_df[actual_mask].index, y=final_df.loc[actual_mask, 'WaterLevel'], 
-            mode='lines', name='實際觀測水位', line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5) 
+            x=final_df[actual_mask].index, 
+            y=final_df.loc[actual_mask, 'WaterLevel'], 
+            mode='lines', 
+            name='實際觀測水位', 
+            line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5),
+            hovertemplate='日期: %{x|%Y-%m-%d}<br>實際水位: %{y:.3f} m<extra></extra>'
         ), row=1, col=1)
         
         sim_mask = final_df['WaterLevel_Simulated'].notna()
         fig.add_trace(go.Scatter(
-            x=final_df[sim_mask].index, y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
-            mode='lines', name='AI 模擬補遺水位', line=dict(color='#FF4B4B', width=2) 
+            x=final_df[sim_mask].index, 
+            y=final_df[sim_mask]['WaterLevel_Simulated'], 
+            mode='lines', 
+            name='AI 模擬補遺水位', 
+            line=dict(color='#FF4B4B', width=2),
+            hovertemplate='日期: %{x|%Y-%m-%d}<br>模擬水位: %{y:.3f} m<extra></extra>'
         ), row=1, col=1)
         
-        fig.add_trace(go.Bar(x=final_df.index, y=final_df['Rainfall'], 
-                             name='日雨量', marker_color='rgba(0, 191, 255, 0.7)'),
-                      row=2, col=1)
+        fig.add_trace(go.Bar(
+            x=final_df.index, 
+            y=final_df['Rainfall'], 
+            name='日雨量', 
+            marker_color='rgba(0, 191, 255, 0.7)',
+            hovertemplate='日期: %{x|%Y-%m-%d}<br>日雨量: %{y:.1f} mm<extra></extra>'
+        ), row=2, col=1)
 
-        # 🌟 這裡移除了 autorange="reversed"，Y 軸改回正常的數學正向軸（越負越下面）
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         fig.update_xaxes(title_text="日期", row=2, col=1)
-        fig.update_layout(height=750, hovermode="x unified", legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)'))
+        
+        # 讓 hover 效果全圖表共用，滑鼠懸停時能一口氣看見當天的所有數值
+        fig.update_layout(
+            height=750, 
+            hovermode="x unified", 
+            legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)')
+        )
         
         st.plotly_chart(fig, use_container_width=True)
         
