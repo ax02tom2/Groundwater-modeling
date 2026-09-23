@@ -185,6 +185,9 @@ if rain_file and hobo_file:
         final_df['WaterLevel_Simulated'] = np.nan
         final_df.loc[predict_data_copy.index, 'WaterLevel_Simulated'] = predict_data_copy['WaterLevel_Simulated']
         
+        # 🌟 關鍵技巧：將索引轉換為純字串格式（例如 "2018-10-05"），徹底消滅 Plotly 自動產生的英文日期標頭！
+        date_str_index = final_df.index.strftime('%Y-%m-%d')
+        
         # --- 繪圖與呈現 ---
         st.markdown("### 📈 地下水位與雨量動態圖")
         fig = make_subplots(
@@ -193,39 +196,38 @@ if rain_file and hobo_file:
         )
         
         actual_mask = final_df['WaterLevel'].notna()
-        # 🌟 自定義 hovertemplate：第一行直接顯示純數字日期，後面接數值
         fig.add_trace(go.Scatter(
-            x=final_df[actual_mask].index, 
+            x=date_str_index[actual_mask], 
             y=final_df.loc[actual_mask, 'WaterLevel'], 
             mode='lines', 
             name='實際觀測水位', 
             line=dict(color='rgba(31, 119, 180, 0.4)', width=2.5),
-            hovertemplate='日期: %{x|%Y-%m-%d}<br>實際水位: %{y:.3f} m<extra></extra>'
+            hovertemplate='實際水位: %{y:.3f} m<extra></extra>'
         ), row=1, col=1)
         
         sim_mask = final_df['WaterLevel_Simulated'].notna()
         fig.add_trace(go.Scatter(
-            x=final_df[sim_mask].index, 
-            y=final_df[sim_mask]['WaterLevel_Simulated'], 
+            x=date_str_index[sim_mask], 
+            y=final_df.loc[sim_mask, 'WaterLevel_Simulated'], 
             mode='lines', 
             name='AI 模擬補遺水位', 
             line=dict(color='#FF4B4B', width=2),
-            hovertemplate='日期: %{x|%Y-%m-%d}<br>模擬水位: %{y:.3f} m<extra></extra>'
+            hovertemplate='模擬水位: %{y:.3f} m<extra></extra>'
         ), row=1, col=1)
         
         fig.add_trace(go.Bar(
-            x=final_df.index, 
+            x=date_str_index, 
             y=final_df['Rainfall'], 
             name='日雨量', 
             marker_color='rgba(0, 191, 255, 0.7)',
-            hovertemplate='日期: %{x|%Y-%m-%d}<br>日雨量: %{y:.1f} mm<extra></extra>'
+            hovertemplate='日雨量: %{y:.1f} mm<extra></extra>'
         ), row=2, col=1)
 
         fig.update_yaxes(title_text="地下水位 (m)", row=1, col=1)
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         fig.update_xaxes(title_text="日期", row=2, col=1)
         
-        # 🌟 透過 hoverlabel 設定把預設的英文標頭隱藏，並讓畫面極致簡潔
+        # 🌟 將當前滑鼠所在的時間點資料直接作為 hoverbox 的頂部標頭顯示
         fig.update_layout(
             height=750, 
             hovermode="x unified", 
