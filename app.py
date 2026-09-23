@@ -193,7 +193,7 @@ if rain_file and hobo_file:
         )
         
         actual_mask = final_df['WaterLevel'].notna()
-        # 🌟 加入自定義 hovertemplate，將時間精確到年月日數字格式，並明確標示數值
+        # 🌟 自定義 hovertemplate：第一行直接顯示純數字日期，後面接數值
         fig.add_trace(go.Scatter(
             x=final_df[actual_mask].index, 
             y=final_df.loc[actual_mask, 'WaterLevel'], 
@@ -225,11 +225,12 @@ if rain_file and hobo_file:
         fig.update_yaxes(title_text="日雨量 (mm)", row=2, col=1)
         fig.update_xaxes(title_text="日期", row=2, col=1)
         
-        # 讓 hover 效果全圖表共用，滑鼠懸停時能一口氣看見當天的所有數值
+        # 🌟 透過 hoverlabel 設定把預設的英文標頭隱藏，並讓畫面極致簡潔
         fig.update_layout(
             height=750, 
             hovermode="x unified", 
-            legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)')
+            legend=dict(x=0.01, y=0.98, bgcolor='rgba(255,255,255,0.8)'),
+            hoverlabel=dict(bgcolor="white", font_size=13, font_family="monospace")
         )
         
         st.plotly_chart(fig, use_container_width=True)
